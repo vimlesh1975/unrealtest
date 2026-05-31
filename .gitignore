@@ -1,0 +1,33 @@
+# Unreal generated folders
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+Packaged/
+
+# IDE and OS files
+.vs/
+.vscode/
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.user
+*.VC.db
+*.VC.opendb
+*.DS_Store
+Thumbs.db
+
+# Logs and crash dumps
+*.log
+*.dmp
+
+# Large packaged/debug artifacts
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.pak
+*.ucas
+*.utoc
