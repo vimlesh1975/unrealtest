@@ -121,7 +121,7 @@ void AGGGGameModeBase::SetupDeckLinkOutputs(const TArray<AActor*>& OrderedCamera
 	static constexpr int32 DesiredOutputCount = 4;
 	static constexpr int32 OutputWidth = 1920;
 	static constexpr int32 OutputHeight = 1080;
-	static constexpr int32 OutputFrameRate = 30;
+	static constexpr int32 OutputFrameRate = 25;
 
 	DeckLinkRenderTargets.Reset();
 	DeckLinkSceneCaptures.Reset();
@@ -188,7 +188,7 @@ void AGGGGameModeBase::SetupDeckLinkOutputs(const TArray<AActor*>& OrderedCamera
 		DeckLinkMediaCaptures.Add(MediaCapture);
 		if (!MediaCapture->CaptureTextureRenderTarget2D(RenderTarget, CaptureOptions))
 		{
-			UE_LOG(LogTemp, Warning, TEXT("DeckLink output %d failed to start. Check Blackmagic Desktop Video driver, card availability, and 1080p30 support."), Index + 1);
+			UE_LOG(LogTemp, Warning, TEXT("DeckLink output %d failed to start. Check Blackmagic Desktop Video driver, card availability, and 1080i50 support."), Index + 1);
 			continue;
 		}
 
@@ -200,7 +200,7 @@ bool AGGGGameModeBase::FindDeckLinkOutputConfiguration(int32 DeviceIdentifier, F
 {
 	static constexpr int32 OutputWidth = 1920;
 	static constexpr int32 OutputHeight = 1080;
-	static constexpr int32 OutputFrameRate = 30;
+	static constexpr int32 OutputFrameRate = 25;
 
 	FBlackmagicDeviceProvider Provider;
 	const TArray<FMediaIOOutputConfiguration> Configurations = Provider.GetOutputConfigurations();
@@ -226,7 +226,7 @@ bool AGGGGameModeBase::FindDeckLinkOutputConfiguration(int32 DeviceIdentifier, F
 
 		if (MediaConfiguration.MediaMode.Resolution == FIntPoint(OutputWidth, OutputHeight)
 			&& MediaConfiguration.MediaMode.FrameRate == FFrameRate(OutputFrameRate, 1)
-			&& MediaConfiguration.MediaMode.Standard == EMediaIOStandardType::Progressive)
+			&& MediaConfiguration.MediaMode.Standard == EMediaIOStandardType::Interlaced)
 		{
 			OutConfiguration = Configuration;
 			return true;
@@ -236,7 +236,7 @@ bool AGGGGameModeBase::FindDeckLinkOutputConfiguration(int32 DeviceIdentifier, F
 	if (FirstFillForDevice)
 	{
 		OutConfiguration = *FirstFillForDevice;
-		UE_LOG(LogTemp, Warning, TEXT("DeckLink device %d: 1080p30 was not found; using the first available fill output mode instead."), DeviceIdentifier);
+		UE_LOG(LogTemp, Warning, TEXT("DeckLink device %d: 1080i50 was not found; using the first available fill output mode instead."), DeviceIdentifier);
 		return true;
 	}
 
