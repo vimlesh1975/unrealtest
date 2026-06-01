@@ -11,7 +11,10 @@ public class GGGProject : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
-			"InputCore"
+			"InputCore",
+			"MediaIOCore",
+			"BlackmagicMedia",
+			"BlackmagicMediaOutput"
 		});
 	}
 }

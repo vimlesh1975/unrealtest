@@ -14,6 +14,10 @@
 		{
 			"Name": "PythonScriptPlugin",
 			"Enabled": true
+		},
+		{
+			"Name": "BlackmagicMedia",
+			"Enabled": true
 		}
 	],
 	"TargetPlatforms": [
