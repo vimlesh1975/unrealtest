@@ -1,0 +1,61 @@
+/Game/000_wTV_AR/Media/MediaProfiles/ZX.ZX: MediaProfile /Game/000_wTV_AR/Media/MediaProfiles/ZX.ZX
+  media_sources: ["/Script/BlackmagicMedia.BlackmagicMediaSource'/Game/000_wTV_AR/Media/MediaProfiles/ZX.ZX:BlackmagicMediaSource_0'", "/Script/BlackmagicMedia.BlackmagicMediaSource'/Game/000_wTV_AR/Media/MediaProfiles/ZX.ZX:BlackmagicMediaSource_1'", "/Script/BlackmagicMedia.BlackmagicMediaSource'/Game/000_wTV_AR/Media/MediaProfiles/ZX.ZX:BlackmagicMediaSource_2'", None, None]
+  media_outputs: ["/Script/BlackmagicMediaOutput.BlackmagicMediaOutput'/Game/000_wTV_AR/Media/MediaProfiles/ZX.ZX:BlackmagicMediaOutput_0'", None, None, None]
+  override_timecode_provider: False
+  timecode_provider: None
+  override_custom_time_step: True
+  custom_time_step: GenlockedFixedRateCustomTimeStep /Game/000_wTV_AR/Media/MediaProfiles/ZX.ZX:GenlockedFixedRateCustomTimeStep_0
+
+/Game/000_wTV_AR/Media/MediaProfiles/CATB.CATB: MediaProfile /Game/000_wTV_AR/Media/MediaProfiles/CATB.CATB
+  media_sources: ["/Script/BlackmagicMedia.BlackmagicMediaSource'/Game/000_wTV_AR/Media/MediaProfiles/CATB.CATB:BlackmagicMediaSource_0'", "/Script/BlackmagicMedia.BlackmagicMediaSource'/Game/000_wTV_AR/Media/MediaProfiles/CATB.CATB:BlackmagicMediaSource_1'", "/Script/BlackmagicMedia.BlackmagicMediaSource'/Game/000_wTV_AR/Media/MediaProfiles/CATB.CATB:BlackmagicMediaSource_2'", None, None]
+  media_outputs: ["/Script/BlackmagicMediaOutput.BlackmagicMediaOutput'/Game/000_wTV_AR/Media/MediaProfiles/CATB.CATB:BlackmagicMediaOutput_0'", "/Script/BlackmagicMediaOutput.BlackmagicMediaOutput'/Game/000_wTV_AR/Media/MediaProfiles/CATB.CATB:BlackmagicMediaOutput_1'", "/Script/BlackmagicMediaOutput.BlackmagicMediaOutput'/Game/000_wTV_AR/Media/MediaProfiles/CATB.CATB:BlackmagicMediaOutput_2'", None]
+  override_timecode_provider: False
+  timecode_provider: None
+  override_custom_time_step: True
+  custom_time_step: GenlockedFixedRateCustomTimeStep /Game/000_wTV_AR/Media/MediaProfiles/CATB.CATB:GenlockedFixedRateCustomTimeStep_0
+
+/Game/000_wTV_AR/Media/MediaProfiles/CATC.CATC: MediaProfile /Game/000_wTV_AR/Media/MediaProfiles/CATC.CATC
+  media_sources: ["/Script/BlackmagicMedia.BlackmagicMediaSource'/Game/000_wTV_AR/Media/MediaProfiles/CATC.CATC:BlackmagicMediaSource_0'", "/Script/BlackmagicMedia.BlackmagicMediaSource'/Game/000_wTV_AR/Media/MediaProfiles/CATC.CATC:BlackmagicMediaSource_1'", None, None, None]
+  media_outputs: ["/Script/BlackmagicMediaOutput.BlackmagicMediaOutput'/Game/000_wTV_AR/Media/MediaProfiles/CATC.CATC:BlackmagicMediaOutput_0'", "/Script/BlackmagicMediaOutput.BlackmagicMediaOutput'/Game/000_wTV_AR/Media/MediaProfiles/CATC.CATC:BlackmagicMediaOutput_1'", None, None]
+  override_timecode_provider: False
+  timecode_provider: None
+  override_custom_time_step: True
+  custom_time_step: GenlockedFixedRateCustomTimeStep /Game/000_wTV_AR/Media/MediaProfiles/CATC.CATC:GenlockedFixedRateCustomTimeStep_0
+
+/Game/000_wTV_AR/Media/MediaProfiles/CATH.CATH: MediaProfile /Game/000_wTV_AR/Media/MediaProfiles/CATH.CATH
+  media_sources: ["/Script/BlackmagicMedia.BlackmagicMediaSource'/Game/000_wTV_AR/Media/MediaProfiles/CATH.CATH:BlackmagicMediaSource_0'", "/Script/BlackmagicMedia.BlackmagicMediaSource'/Game/000_wTV_AR/Media/MediaProfiles/CATH.CATH:BlackmagicMediaSource_1'", "/Script/BlackmagicMedia.BlackmagicMediaSource'/Game/000_wTV_AR/Media/MediaProfiles/CATH.CATH:BlackmagicMediaSource_2'", "/Script/BlackmagicMedia.BlackmagicMediaSource'/Game/000_wTV_AR/Media/MediaProfiles/CATH.CATH:BlackmagicMediaSource_3'", None]
+  media_outputs: ["/Script/BlackmagicMediaOutput.BlackmagicMediaOutput'/Game/000_wTV_AR/Media/MediaProfiles/CATH.CATH:BlackmagicMediaOutput_0'", "/Script/BlackmagicMediaOutput.BlackmagicMediaOutput'/Game/000_wTV_AR/Media/MediaProfiles/CATH.CATH:BlackmagicMediaOutput_1'", "/Script/BlackmagicMediaOutput.BlackmagicMediaOutput'/Game/000_wTV_AR/Media/MediaProfiles/CATH.CATH:BlackmagicMediaOutput_2'", "/Script/BlackmagicMediaOutput.BlackmagicMediaOutput'/Game/000_wTV_AR/Media/MediaProfiles/CATH.CATH:BlackmagicMediaOutput_3'"]
+  override_timecode_provider: False
+  timecode_provider: None
+  override_custom_time_step: True
+  custom_time_step: GenlockedFixedRateCustomTimeStep /Game/000_wTV_AR/Media/MediaProfiles/CATH.CATH:GenlockedFixedRateCustomTimeStep_0
+
+/Game/000_wTV_AR/Media/Proxies/MediaOutput-01.MediaOutput-01: ProxyMediaOutput /Game/000_wTV_AR/Media/Proxies/MediaOutput-01.MediaOutput-01
+  proxy: None
+
+/Game/000_wTV_AR/Media/Proxies/MediaOutput-02.MediaOutput-02: ProxyMediaOutput /Game/000_wTV_AR/Media/Proxies/MediaOutput-02.MediaOutput-02
+  proxy: None
+
+/Game/000_wTV_AR/Media/Proxies/MediaOutput-03.MediaOutput-03: ProxyMediaOutput /Game/000_wTV_AR/Media/Proxies/MediaOutput-03.MediaOutput-03
+  proxy: None
+
+/Game/000_wTV_AR/Media/Proxies/MediaOutput-04.MediaOutput-04: ProxyMediaOutput /Game/000_wTV_AR/Media/Proxies/MediaOutput-04.MediaOutput-04
+  proxy: None
+
+/Game/MoSys/Media/Output/Output.Output: BlackmagicMediaOutput /Game/MoSys/Media/Output/Output.Output
+  audio_bit_depth: <BlackmagicMediaOutputAudioBitDepth.SIGNED_16_BITS: 16>
+  audio_buffer_size: 5120
+  audio_sample_rate: <BlackmagicMediaOutputAudioSampleRate.SR_48K: 48000>
+  encode_timecode_in_texel: False
+  output_audio: False
+  output_channel_count: <BlackmagicMediaAudioOutputChannelCount.CH_2: 2>
+  pixel_format: <BlackmagicMediaOutputPixelFormat.PF_10BIT_YUV: 1>
+  timecode_format: <MediaIOTimecodeFormat.NONE: 0>
+  use_multithreaded_scheduling: False
+  wait_for_sync_event: False
+  output_configuration: <Struct 'MediaIOOutputConfiguration' (0x00000953CB789198) {}>
+  number_of_blackmagic_buffers: 3
+  interlaced_fields_timecode_need_to_match: False
+  log_drop_frame: False
+  invert_key_output: False
+  hdr_options: <Struct 'BlackmagicMediaHDROptions' (0x00000953CB789205) {}>
