@@ -6,6 +6,7 @@
 #include "Camera/CameraComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/Engine.h"
+#include "Engine/Canvas.h"
 #include "Engine/SceneCapture2D.h"
 #include "Engine/World.h"
 #include "Engine/TextureRenderTarget2D.h"
@@ -92,7 +93,13 @@ bool IsEquivalentFrameRate(const FFrameRate& FrameRate, int32 Numerator, int32 D
 AGGGGameModeBase::AGGGGameModeBase()
 {
 	DefaultPawnClass = nullptr;
+	HUDClass = AGGGPreviewHUD::StaticClass();
 	PrimaryActorTick.bCanEverTick = true;
+}
+
+const TArray<TObjectPtr<UTextureRenderTarget2D>>& AGGGGameModeBase::GetDeckLinkPreviewTargets() const
+{
+	return DeckLinkRenderTargets;
 }
 
 void AGGGGameModeBase::BeginPlay()
@@ -207,7 +214,7 @@ void AGGGGameModeBase::SetupSplitScreenCameras()
 	SelectedCameraIndex = 0;
 	ShowCameraControlStatus();
 	UpdateSelectedViewportCamera();
-	UE_LOG(LogTemp, Display, TEXT("Viewport preview is using the selected camera; DeckLink outputs receive the four camera feeds."));
+	UE_LOG(LogTemp, Display, TEXT("Viewport monitor grid is showing cameras 1-4 from the DeckLink render targets."));
 
 	SetupDeckLinkOutputs(OrderedCameras);
 }
@@ -300,7 +307,7 @@ void AGGGGameModeBase::ShowCameraControlStatus() const
 	}
 }
 
-void AGGGGameModeBase::UpdateSelectedViewportCamera() const
+void AGGGGameModeBase::UpdateSelectedViewportCamera()
 {
 	UWorld* World = GetWorld();
 	if (!World)
@@ -308,12 +315,64 @@ void AGGGGameModeBase::UpdateSelectedViewportCamera() const
 		return;
 	}
 
-	ACameraActor* SelectedCamera = ControlledCameras.IsValidIndex(SelectedCameraIndex) ? ControlledCameras[SelectedCameraIndex].Get() : nullptr;
-	APlayerController* PlayerController = UGameplayStatics::GetPlayerController(World, 0);
-	if (SelectedCamera && PlayerController)
+	if (!MonitorViewportCamera)
 	{
-		PlayerController->SetViewTargetWithBlend(SelectedCamera, 0.0f);
+		FActorSpawnParameters SpawnParameters;
+		SpawnParameters.Name = TEXT("MonitorViewportCamera");
+		MonitorViewportCamera = World->SpawnActor<ACameraActor>(FVector(0.0f, 0.0f, 100000.0f), FRotator::ZeroRotator, SpawnParameters);
+		if (UCameraComponent* CameraComponent = MonitorViewportCamera ? MonitorViewportCamera->GetCameraComponent() : nullptr)
+		{
+			CameraComponent->SetFieldOfView(5.0f);
+		}
 	}
+
+	APlayerController* PlayerController = UGameplayStatics::GetPlayerController(World, 0);
+	if (MonitorViewportCamera && PlayerController)
+	{
+		PlayerController->SetViewTarget(MonitorViewportCamera);
+		PlayerController->SetViewTargetWithBlend(MonitorViewportCamera, 0.0f);
+	}
+}
+
+void AGGGPreviewHUD::DrawHUD()
+{
+	Super::DrawHUD();
+
+	if (!Canvas || !GetWorld())
+	{
+		return;
+	}
+
+	const AGGGGameModeBase* GameMode = Cast<AGGGGameModeBase>(UGameplayStatics::GetGameMode(GetWorld()));
+	if (!GameMode)
+	{
+		return;
+	}
+
+	const TArray<TObjectPtr<UTextureRenderTarget2D>>& PreviewTargets = GameMode->GetDeckLinkPreviewTargets();
+	if (PreviewTargets.Num() < 4)
+	{
+		return;
+	}
+
+	const float HalfWidth = Canvas->ClipX * 0.5f;
+	const float HalfHeight = Canvas->ClipY * 0.5f;
+	for (int32 Index = 0; Index < 4; ++Index)
+	{
+		UTextureRenderTarget2D* Texture = PreviewTargets[Index].Get();
+		if (!Texture)
+		{
+			continue;
+		}
+
+		const float X = (Index % 2) * HalfWidth;
+		const float Y = (Index / 2) * HalfHeight;
+		DrawTexture(Texture, X, Y, HalfWidth, HalfHeight, 0.0f, 0.0f, 1.0f, 1.0f, FLinearColor::White, BLEND_Opaque);
+	}
+
+	constexpr float SeparatorThickness = 2.0f;
+	DrawRect(FLinearColor::Black, HalfWidth - SeparatorThickness * 0.5f, 0.0f, SeparatorThickness, Canvas->ClipY);
+	DrawRect(FLinearColor::Black, 0.0f, HalfHeight - SeparatorThickness * 0.5f, Canvas->ClipX, SeparatorThickness);
 }
 
 void AGGGGameModeBase::SyncDeckLinkCaptures()

@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/GameModeBase.h"
+#include "GameFramework/HUD.h"
 #include "GGGGameModeBase.generated.h"
 
 class ACameraActor;
@@ -14,12 +15,22 @@ class UTextureRenderTarget2D;
 struct FMediaIOOutputConfiguration;
 
 UCLASS()
+class GGGPROJECT_API AGGGPreviewHUD : public AHUD
+{
+	GENERATED_BODY()
+
+public:
+	virtual void DrawHUD() override;
+};
+
+UCLASS()
 class GGGPROJECT_API AGGGGameModeBase : public AGameModeBase
 {
 	GENERATED_BODY()
 
 public:
 	AGGGGameModeBase();
+	const TArray<TObjectPtr<UTextureRenderTarget2D>>& GetDeckLinkPreviewTargets() const;
 
 protected:
 	virtual void BeginPlay() override;
@@ -32,13 +43,16 @@ private:
 	void HandleCameraControl(float DeltaSeconds);
 	void SyncDeckLinkCaptures();
 	void SyncDeckLinkCapture(int32 CameraIndex, bool bCaptureScene);
-	void UpdateSelectedViewportCamera() const;
+	void UpdateSelectedViewportCamera();
 	void LogDeckLinkOutputConfigurations() const;
 	void ShowCameraControlStatus() const;
 	bool FindDeckLinkOutputConfiguration(int32 DeviceIdentifier, FMediaIOOutputConfiguration& OutConfiguration) const;
 
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<ACameraActor>> ControlledCameras;
+
+	UPROPERTY(Transient)
+	TObjectPtr<ACameraActor> MonitorViewportCamera;
 
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UTextureRenderTarget2D>> DeckLinkRenderTargets;
