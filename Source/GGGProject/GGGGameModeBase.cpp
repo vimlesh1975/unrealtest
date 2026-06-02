@@ -23,6 +23,7 @@
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/GameUserSettings.h"
 #include "GenlockedFixedRateCustomTimeStep.h"
+#include "HAL/FileManager.h"
 #include "HAL/IConsoleManager.h"
 #include "HttpResultCallback.h"
 #include "HttpServerModule.h"
@@ -119,19 +120,27 @@ bool IsEquivalentFrameRate(const FFrameRate& FrameRate, int32 Numerator, int32 D
 const FVector StudioCameraFocusPoint(0.0f, 610.0f, 250.0f);
 const FVector DeckLinkInputPlateDefaultLocation(-280.0f, 610.0f, 255.0f);
 const FRotator DeckLinkInputPlateDefaultRotation(0.0f, 0.0f, 90.0f);
-const FVector DeckLinkInputPlateDefaultScale(4.2f, 2.3625f, 1.0f);
+const FVector DeckLinkInputPlateDefaultScale(-4.2f, 2.3625f, 1.0f);
 constexpr float DeckLinkInputPlateMinScale = 0.2f;
 constexpr float DeckLinkInputPlateMaxScale = 5.0f;
 const TCHAR* ExpressLoopMediaRelativePath = TEXT("media/express_loop.mp4");
 const FVector ExpressLoopMediaPlateLocation(280.0f, 610.0f, 255.0f);
 const FRotator ExpressLoopMediaPlateRotation(0.0f, 0.0f, 90.0f);
-const FVector ExpressLoopMediaPlateScale(4.2f, 2.3625f, 1.0f);
+const FVector ExpressLoopMediaPlateScale(-4.2f, 2.3625f, 1.0f);
 constexpr float ExpressLoopMediaPlateMinScale = 0.2f;
 constexpr float ExpressLoopMediaPlateMaxScale = 5.0f;
+constexpr int64 ExpressLoopMediaPrecacheMaxBytes = 256LL * 1024LL * 1024LL;
+constexpr double ExpressLoopMediaLoopLeadMilliseconds = 80.0;
 
 float ClampControlDeltaSeconds(float DeltaSeconds)
 {
 	return FMath::Clamp(DeltaSeconds, 0.0f, 0.25f);
+}
+
+bool ShouldPrecacheExpressLoopMediaFile(const FString& FilePath)
+{
+	const int64 FileSize = IFileManager::Get().FileSize(*FilePath);
+	return FileSize >= 0 && FileSize <= ExpressLoopMediaPrecacheMaxBytes;
 }
 
 float ReadJsonNumber(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName, float DefaultValue = 0.0f)
@@ -1000,7 +1009,7 @@ bool AGGGGameModeBase::OpenExpressLoopMediaFile(const FString& FilePath, bool bS
 	}
 
 	ExpressLoopMediaSource->SetFilePath(FullMediaPath);
-	ExpressLoopMediaSource->PrecacheFile = false;
+	ExpressLoopMediaSource->PrecacheFile = ShouldPrecacheExpressLoopMediaFile(FullMediaPath);
 	ExpressLoopMediaPlayer->Close();
 	ExpressLoopMediaPlayer->SetLooping(true);
 	const bool bOpened = ExpressLoopMediaPlayer->OpenSource(ExpressLoopMediaSource);
@@ -1029,42 +1038,142 @@ bool AGGGGameModeBase::OpenExpressLoopMediaFile(const FString& FilePath, bool bS
 
 void AGGGGameModeBase::HandleExpressLoopMediaEndReached()
 {
-	RestartExpressLoopMediaPlayback(true);
+	UE_LOG(LogTemp, Display, TEXT("Express loop media plate end reached; rewinding without reopening."));
+	LoopExpressLoopMediaPlayback(true);
 }
 
-void AGGGGameModeBase::RestartExpressLoopMediaPlayback(bool bFromEndReached)
+void AGGGGameModeBase::HandleExpressLoopMediaOpened(FString OpenedUrl)
 {
-	if (!ExpressLoopMediaPlayer || ExpressLoopMediaFilePath.IsEmpty())
+	if (!ExpressLoopMediaPlayer)
 	{
 		return;
 	}
 
 	ExpressLoopMediaPlayer->SetLooping(true);
-	const bool bSeeked = ExpressLoopMediaPlayer->Seek(FTimespan::Zero()) || ExpressLoopMediaPlayer->Rewind();
 	const bool bPlaying = ExpressLoopMediaPlayer->Play();
 	ExpressLoopMediaPlayer->SetRate(1.0f);
-	ExpressLoopMediaStatus = FString::Printf(TEXT("Playing %s"), *ExpressLoopMediaFilePath);
-	UE_LOG(LogTemp, Display, TEXT("Express loop media plate loop restart%s: seek=%s play=%s."),
+	UE_LOG(LogTemp, Display, TEXT("Express loop media plate opened %s; play=%s."),
+		*OpenedUrl,
+		bPlaying ? TEXT("yes") : TEXT("no"));
+}
+
+void AGGGGameModeBase::LoopExpressLoopMediaPlayback(bool bFromEndReached)
+{
+	if (!ExpressLoopMediaSource || !ExpressLoopMediaPlayer || ExpressLoopMediaFilePath.IsEmpty() || bExpressLoopMediaRestarting)
+	{
+		return;
+	}
+
+	bExpressLoopMediaRestarting = true;
+	ExpressLoopMediaPlayer->SetLooping(true);
+
+	bool bSeeked = ExpressLoopMediaPlayer->Seek(FTimespan::Zero());
+	if (!bSeeked)
+	{
+		bSeeked = ExpressLoopMediaPlayer->Rewind();
+	}
+
+	bool bPlaying = false;
+	if (bSeeked)
+	{
+		bPlaying = ExpressLoopMediaPlayer->Play();
+		ExpressLoopMediaPlayer->SetRate(1.0f);
+		ExpressLoopMediaStatus = FString::Printf(TEXT("Playing %s"), *ExpressLoopMediaFilePath);
+	}
+
+	UE_LOG(LogTemp, Display, TEXT("Express loop media plate loop%s: seek=%s play=%s."),
 		bFromEndReached ? TEXT(" after end") : TEXT(" from watchdog"),
 		bSeeked ? TEXT("yes") : TEXT("no"),
 		bPlaying ? TEXT("yes") : TEXT("no"));
+	bExpressLoopMediaRestarting = false;
+
+	if (!bSeeked)
+	{
+		ReopenExpressLoopMediaPlayback(bFromEndReached);
+	}
+}
+
+void AGGGGameModeBase::ReopenExpressLoopMediaPlayback(bool bFromEndReached)
+{
+	if (!ExpressLoopMediaSource || !ExpressLoopMediaPlayer || ExpressLoopMediaFilePath.IsEmpty() || bExpressLoopMediaRestarting)
+	{
+		return;
+	}
+
+	bExpressLoopMediaRestarting = true;
+	const FString LoopMediaFilePath = ExpressLoopMediaFilePath;
+	if (!FPaths::FileExists(LoopMediaFilePath))
+	{
+		ExpressLoopMediaStatus = FString::Printf(TEXT("MP4 loop file not found: %s"), *LoopMediaFilePath);
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *ExpressLoopMediaStatus);
+		bExpressLoopMediaRestarting = false;
+		return;
+	}
+
+	ExpressLoopMediaSource->SetFilePath(LoopMediaFilePath);
+	ExpressLoopMediaSource->PrecacheFile = ShouldPrecacheExpressLoopMediaFile(LoopMediaFilePath);
+	ExpressLoopMediaPlayer->Close();
+	ExpressLoopMediaPlayer->SetLooping(true);
+
+	const bool bOpened = ExpressLoopMediaPlayer->OpenSource(ExpressLoopMediaSource);
+	bool bPlaying = false;
+	if (bOpened)
+	{
+		bPlaying = ExpressLoopMediaPlayer->Play();
+		ExpressLoopMediaPlayer->SetRate(1.0f);
+		ExpressLoopMediaStatus = FString::Printf(TEXT("Playing %s"), *LoopMediaFilePath);
+	}
+	else
+	{
+		ExpressLoopMediaStatus = FString::Printf(TEXT("MP4 loop reopen failed: %s"), *LoopMediaFilePath);
+	}
+
+	if (bOpened)
+	{
+		UE_LOG(LogTemp, Display, TEXT("Express loop media plate reopen fallback%s: open=yes play=%s."),
+			bFromEndReached ? TEXT(" after end") : TEXT(" from watchdog"),
+			bPlaying ? TEXT("yes") : TEXT("no"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Express loop media plate reopen fallback%s: open=no play=no."),
+			bFromEndReached ? TEXT(" after end") : TEXT(" from watchdog"));
+	}
+	bExpressLoopMediaRestarting = false;
 }
 
 void AGGGGameModeBase::KeepExpressLoopMediaLooping()
 {
-	if (!ExpressLoopMediaPlayer || ExpressLoopMediaFilePath.IsEmpty() || ExpressLoopMediaPlayer->IsPlaying())
+	if (!ExpressLoopMediaPlayer || ExpressLoopMediaFilePath.IsEmpty() || bExpressLoopMediaRestarting)
 	{
 		return;
 	}
 
 	const FTimespan Duration = ExpressLoopMediaPlayer->GetDuration();
 	const FTimespan CurrentTime = ExpressLoopMediaPlayer->GetTime();
-	if (Duration <= FTimespan::Zero() || CurrentTime < Duration - FTimespan::FromMilliseconds(500.0))
+	const FTimespan LoopLeadTime = FTimespan::FromMilliseconds(ExpressLoopMediaLoopLeadMilliseconds);
+	if (Duration > LoopLeadTime && CurrentTime >= Duration - LoopLeadTime)
+	{
+		LoopExpressLoopMediaPlayback(false);
+		return;
+	}
+
+	if (ExpressLoopMediaPlayer->IsPlaying())
 	{
 		return;
 	}
 
-	RestartExpressLoopMediaPlayback(false);
+	if (Duration <= FTimespan::Zero() || CurrentTime < Duration - FTimespan::FromMilliseconds(500.0))
+	{
+		ExpressLoopMediaPlayer->SetLooping(true);
+		if (ExpressLoopMediaPlayer->Play())
+		{
+			ExpressLoopMediaPlayer->SetRate(1.0f);
+		}
+		return;
+	}
+
+	LoopExpressLoopMediaPlayback(false);
 }
 
 void AGGGGameModeBase::ShowCameraControlStatus() const
@@ -2204,6 +2313,7 @@ void AGGGGameModeBase::SetupExpressLoopMediaPlate()
 	ExpressLoopMediaPlayer->PlayOnOpen = true;
 	ExpressLoopMediaPlayer->SetLooping(true);
 	ExpressLoopMediaPlayer->OnEndReached.AddUniqueDynamic(this, &AGGGGameModeBase::HandleExpressLoopMediaEndReached);
+	ExpressLoopMediaPlayer->OnMediaOpened.AddUniqueDynamic(this, &AGGGGameModeBase::HandleExpressLoopMediaOpened);
 
 	ExpressLoopMediaTexture = NewObject<UMediaTexture>(this, TEXT("ExpressLoopMediaTexture"));
 	ExpressLoopMediaTexture->SetMediaPlayer(ExpressLoopMediaPlayer);

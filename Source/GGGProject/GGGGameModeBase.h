@@ -106,7 +106,10 @@ private:
 	bool OpenExpressLoopMediaFile(const FString& FilePath, bool bShowStatus);
 	UFUNCTION()
 	void HandleExpressLoopMediaEndReached();
-	void RestartExpressLoopMediaPlayback(bool bFromEndReached);
+	UFUNCTION()
+	void HandleExpressLoopMediaOpened(FString OpenedUrl);
+	void LoopExpressLoopMediaPlayback(bool bFromEndReached);
+	void ReopenExpressLoopMediaPlayback(bool bFromEndReached);
 	void KeepExpressLoopMediaLooping();
 	void SyncDeckLinkCaptures();
 	void SyncDeckLinkCapture(int32 CameraIndex, bool bCaptureScene);
@@ -218,6 +221,7 @@ private:
 	int32 SelectedCameraIndex = 0;
 	bool bControllingDeckLinkInputPlate = false;
 	bool bControllingExpressLoopMediaPlate = false;
+	bool bExpressLoopMediaRestarting = false;
 	float DeckLinkInputPlateScaleFactor = 1.0f;
 	float ExpressLoopMediaPlateScaleFactor = 1.0f;
 };
