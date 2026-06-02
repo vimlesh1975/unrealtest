@@ -15,7 +15,8 @@ public class GGGProject : ModuleRules
 			"MediaIOCore",
 			"BlackmagicMedia",
 			"BlackmagicMediaOutput",
-			"TimeManagement"
+			"TimeManagement",
+			"MediaAssets"
 		});
 	}
 }

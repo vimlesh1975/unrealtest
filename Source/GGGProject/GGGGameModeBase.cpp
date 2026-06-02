@@ -1,13 +1,17 @@
 #include "GGGGameModeBase.h"
 
 #include "BlackmagicMediaOutput.h"
+#include "BlackmagicMediaSource.h"
 #include "BlackmagicDeviceProvider.h"
 #include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
+#include "Components/SceneComponent.h"
+#include "Components/StaticMeshComponent.h"
 #include "Engine/Engine.h"
 #include "Engine/Canvas.h"
 #include "Engine/SceneCapture2D.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "GameFramework/PlayerController.h"
@@ -16,9 +20,14 @@
 #include "InputCoreTypes.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Kismet/GameplayStatics.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "Materials/MaterialInterface.h"
 #include "MediaCapture.h"
 #include "MediaIOCoreDefinitions.h"
+#include "MediaPlayer.h"
+#include "MediaTexture.h"
 #include "TimerManager.h"
+#include "UObject/ConstructorHelpers.h"
 
 namespace
 {
@@ -95,6 +104,12 @@ AGGGGameModeBase::AGGGGameModeBase()
 	DefaultPawnClass = nullptr;
 	HUDClass = AGGGPreviewHUD::StaticClass();
 	PrimaryActorTick.bCanEverTick = true;
+
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> DisplayMeshFinder(TEXT("/Engine/BasicShapes/Cube.Cube"));
+	DeckLinkInputDisplayMesh = DisplayMeshFinder.Object;
+
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> ScreenMaterialFinder(TEXT("/Engine/EngineMaterials/Widget3DPassThrough_Opaque.Widget3DPassThrough_Opaque"));
+	DeckLinkInputScreenMaterial = ScreenMaterialFinder.Object;
 }
 
 const TArray<TObjectPtr<UTextureRenderTarget2D>>& AGGGGameModeBase::GetDeckLinkPreviewTargets() const
@@ -216,6 +231,7 @@ void AGGGGameModeBase::SetupSplitScreenCameras()
 	UpdateSelectedViewportCamera();
 	UE_LOG(LogTemp, Display, TEXT("Viewport monitor grid is showing cameras 1-4 from the DeckLink render targets."));
 
+	SetupDeckLinkInputScreen();
 	SetupDeckLinkOutputs(OrderedCameras);
 }
 
@@ -375,6 +391,100 @@ void AGGGPreviewHUD::DrawHUD()
 	DrawRect(FLinearColor::Black, 0.0f, HalfHeight - SeparatorThickness * 0.5f, Canvas->ClipX, SeparatorThickness);
 }
 
+void AGGGGameModeBase::SetupDeckLinkInputScreen()
+{
+	static constexpr int32 DeckLinkInputDeviceId = 5;
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	FMediaIOConfiguration InputConfiguration;
+	if (!FindDeckLinkInputConfiguration(DeckLinkInputDeviceId, InputConfiguration))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DeckLink input screen skipped: no Blackmagic input configuration found for device %d."), DeckLinkInputDeviceId);
+		return;
+	}
+
+	DeckLinkInputMediaSource = NewObject<UBlackmagicMediaSource>(this, TEXT("DeckLinkInputDevice5Source"));
+	DeckLinkInputMediaSource->MediaConfiguration = InputConfiguration;
+	DeckLinkInputMediaSource->AutoDetectableTimecodeFormat = EMediaIOAutoDetectableTimecodeFormat::None;
+	DeckLinkInputMediaSource->bCaptureAudio = false;
+	DeckLinkInputMediaSource->bCaptureVideo = true;
+	DeckLinkInputMediaSource->ColorFormat = EBlackmagicMediaSourceColorFormat::YUV8;
+	DeckLinkInputMediaSource->MaxNumVideoFrameBuffer = 8;
+	DeckLinkInputMediaSource->bLogDropFrame = true;
+
+	DeckLinkInputMediaPlayer = NewObject<UMediaPlayer>(this, TEXT("DeckLinkInputDevice5Player"));
+	DeckLinkInputMediaPlayer->PlayOnOpen = true;
+
+	DeckLinkInputMediaTexture = NewObject<UMediaTexture>(this, TEXT("DeckLinkInputDevice5Texture"));
+	DeckLinkInputMediaTexture->SetMediaPlayer(DeckLinkInputMediaPlayer);
+	DeckLinkInputMediaTexture->UpdateResource();
+
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Name = TEXT("DeckLinkInputDevice5Screen");
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	DeckLinkInputScreenActor = World->SpawnActor<AActor>(AActor::StaticClass(), FVector(0.0f, 0.0f, 120.0f), FRotator::ZeroRotator, SpawnParameters);
+	if (!DeckLinkInputScreenActor)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DeckLink input screen skipped: could not spawn the screen actor."));
+		return;
+	}
+
+	USceneComponent* DisplayRootComponent = NewObject<USceneComponent>(DeckLinkInputScreenActor, TEXT("DeckLinkInputScreenRoot"));
+	DeckLinkInputScreenActor->SetRootComponent(DisplayRootComponent);
+	DeckLinkInputScreenActor->AddInstanceComponent(DisplayRootComponent);
+	DisplayRootComponent->SetMobility(EComponentMobility::Movable);
+	DisplayRootComponent->RegisterComponent();
+
+	if (!DeckLinkInputDisplayMesh || !DeckLinkInputScreenMaterial)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DeckLink input screen skipped: engine display mesh or video material is unavailable."));
+		return;
+	}
+
+	AddDeckLinkInputScreenMesh(DeckLinkInputScreenActor, DeckLinkInputMediaTexture);
+
+	if (!DeckLinkInputMediaPlayer->OpenSource(DeckLinkInputMediaSource))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DeckLink input device %d failed to open. Check SDI signal, Desktop Video driver, and that device 5 is not in use."), DeckLinkInputDeviceId);
+		return;
+	}
+
+	UE_LOG(LogTemp, Display, TEXT("DeckLink input device %d is placed in the scene as a visible video screen for all cameras."), DeckLinkInputDeviceId);
+}
+
+void AGGGGameModeBase::AddDeckLinkInputScreenMesh(AActor* ScreenActor, UMediaTexture* MediaTexture)
+{
+	if (!ScreenActor || !ScreenActor->GetRootComponent() || !MediaTexture || !DeckLinkInputDisplayMesh || !DeckLinkInputScreenMaterial)
+	{
+		return;
+	}
+
+	DeckLinkInputScreenMeshComponent = NewObject<UStaticMeshComponent>(ScreenActor, TEXT("DeckLinkInputScreenMesh"));
+	DeckLinkInputScreenMeshComponent->SetupAttachment(ScreenActor->GetRootComponent());
+	DeckLinkInputScreenMeshComponent->SetStaticMesh(DeckLinkInputDisplayMesh);
+	DeckLinkInputScreenMeshComponent->SetRelativeScale3D(FVector(4.2f, 2.4f, 2.3625f));
+	DeckLinkInputScreenMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	DeckLinkInputScreenMeshComponent->SetGenerateOverlapEvents(false);
+	DeckLinkInputScreenMeshComponent->SetCastShadow(false);
+	DeckLinkInputScreenMeshComponent->bReceivesDecals = false;
+
+	ScreenActor->AddInstanceComponent(DeckLinkInputScreenMeshComponent);
+	DeckLinkInputScreenMeshComponent->RegisterComponent();
+
+	UMaterialInstanceDynamic* DynamicMaterial = DeckLinkInputScreenMeshComponent->CreateAndSetMaterialInstanceDynamicFromMaterial(0, DeckLinkInputScreenMaterial);
+	if (DynamicMaterial)
+	{
+		DynamicMaterial->SetTextureParameterValue(TEXT("SlateUI"), MediaTexture);
+		DynamicMaterial->SetVectorParameterValue(TEXT("TintColorAndOpacity"), FLinearColor::White);
+		DynamicMaterial->SetScalarParameterValue(TEXT("OpacityFromTexture"), 1.0f);
+	}
+}
+
 void AGGGGameModeBase::SyncDeckLinkCaptures()
 {
 	const int32 CaptureCount = FMath::Min(ControlledCameras.Num(), DeckLinkSceneCaptures.Num());
@@ -503,7 +613,7 @@ void AGGGGameModeBase::SetupDeckLinkOutputs(const TArray<AActor*>& OrderedCamera
 		MediaOutput->bLogDropFrame = true;
 		MediaOutput->bUseMultithreadedScheduling = false;
 		MediaOutput->bWaitForSyncEvent = false;
-		MediaOutput->NumberOfBlackmagicBuffers = 3;
+		MediaOutput->NumberOfBlackmagicBuffers = 4;
 		DeckLinkMediaOutputs[Index] = MediaOutput;
 
 		UMediaCapture* MediaCapture = MediaOutput->CreateMediaCapture();
@@ -522,6 +632,83 @@ void AGGGGameModeBase::SetupDeckLinkOutputs(const TArray<AActor*>& OrderedCamera
 
 		UE_LOG(LogTemp, Display, TEXT("Camera %d is outputting to DeckLink device %d as 1080i50 10-bit YUV."), Index + 1, DeckLinkDeviceId);
 	}
+}
+
+bool AGGGGameModeBase::FindDeckLinkInputConfiguration(int32 DeviceIdentifier, FMediaIOConfiguration& OutConfiguration) const
+{
+	static constexpr int32 InputWidth = 1920;
+	static constexpr int32 InputHeight = 1080;
+	static constexpr int32 InputFrameRateNumerator = 50;
+	static constexpr int32 InputFrameRateDenominator = 1;
+
+	FBlackmagicDeviceProvider Provider;
+	const TArray<FMediaIOConfiguration> Configurations = Provider.GetConfigurations(true, false);
+	static bool bLoggedInputConfigurations = false;
+	if (!bLoggedInputConfigurations)
+	{
+		bLoggedInputConfigurations = true;
+		UE_LOG(LogTemp, Display, TEXT("Blackmagic reports %d input configurations."), Configurations.Num());
+		for (const FMediaIOConfiguration& Configuration : Configurations)
+		{
+			const FMediaIOConnection& Connection = Configuration.MediaConnection;
+			const FMediaIOMode& Mode = Configuration.MediaMode;
+			UE_LOG(LogTemp, Display, TEXT("Blackmagic input: device %d '%s', port %d, transport %s, mode '%s', %dx%d, rate %d/%d, standard %s, mode id %d")
+				, Connection.Device.DeviceIdentifier
+				, *Connection.Device.DeviceName.ToString()
+				, Connection.PortIdentifier
+				, MediaIOTransportToString(Connection.TransportType)
+				, *Mode.GetModeName().ToString()
+				, Mode.Resolution.X
+				, Mode.Resolution.Y
+				, Mode.FrameRate.Numerator
+				, Mode.FrameRate.Denominator
+				, MediaIOStandardToString(Mode.Standard)
+				, Mode.DeviceModeIdentifier);
+		}
+	}
+
+	const FMediaIOConfiguration* FirstForDevice = nullptr;
+	for (const FMediaIOConfiguration& Configuration : Configurations)
+	{
+		if (Configuration.MediaConnection.Device.DeviceIdentifier != DeviceIdentifier)
+		{
+			continue;
+		}
+
+		if (!FirstForDevice)
+		{
+			FirstForDevice = &Configuration;
+		}
+
+		if (Configuration.MediaMode.Resolution == FIntPoint(InputWidth, InputHeight)
+			&& IsEquivalentFrameRate(Configuration.MediaMode.FrameRate, InputFrameRateNumerator, InputFrameRateDenominator)
+			&& Configuration.MediaMode.Standard == EMediaIOStandardType::Interlaced)
+		{
+			OutConfiguration = Configuration;
+			OutConfiguration.bIsInput = true;
+			UE_LOG(LogTemp, Display, TEXT("DeckLink input device %d: using exact 1080i50 interlaced mode."), DeviceIdentifier);
+			return true;
+		}
+	}
+
+	if (FirstForDevice)
+	{
+		OutConfiguration = *FirstForDevice;
+		OutConfiguration.bIsInput = true;
+		const FMediaIOMode& FallbackMode = FirstForDevice->MediaMode;
+		UE_LOG(LogTemp, Warning, TEXT("DeckLink input device %d: 1080i50 was not found; using fallback %s %dx%d %d/%d %s mode id %d.")
+			, DeviceIdentifier
+			, *FallbackMode.GetModeName().ToString()
+			, FallbackMode.Resolution.X
+			, FallbackMode.Resolution.Y
+			, FallbackMode.FrameRate.Numerator
+			, FallbackMode.FrameRate.Denominator
+			, MediaIOStandardToString(FallbackMode.Standard)
+			, FallbackMode.DeviceModeIdentifier);
+		return true;
+	}
+
+	return false;
 }
 
 bool AGGGGameModeBase::FindDeckLinkOutputConfiguration(int32 DeviceIdentifier, FMediaIOOutputConfiguration& OutConfiguration) const
