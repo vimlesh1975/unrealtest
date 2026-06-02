@@ -2,11 +2,13 @@
 
 #include "Player/BlackmagicMediaPlayer.h"
 
+#include "BlackmagicMediaAudioBridge.h"
 #include "BlackmagicMediaDefinitions.h"
 
 #include "Engine/GameEngine.h"
 #include "HAL/CriticalSection.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "IBlackmagicMediaModule.h"
 #include "IMediaEventSink.h"
 #include "IMediaOptions.h"
@@ -255,9 +257,31 @@ namespace BlackmagicMediaPlayerHelpers
 
 				if (InFrameInfo.AudioBuffer)
 				{
+					static FThreadSafeCounter InputAudioDebugLogCount;
+					const int32* AudioBuffer = reinterpret_cast<int32*>(InFrameInfo.AudioBuffer);
+					const int32 AudioValueCount = InFrameInfo.AudioBufferSize / sizeof(int32);
+					int64 AbsSum = 0;
+					int64 Peak = 0;
+					for (int32 AudioIndex = 0; AudioIndex < AudioValueCount; ++AudioIndex)
+					{
+						const int64 Value = AudioBuffer[AudioIndex];
+						const int64 AbsValue = Value < 0 ? -Value : Value;
+						AbsSum += AbsValue;
+						Peak = FMath::Max(Peak, AbsValue);
+					}
+
+					const int32 DebugIndex = InputAudioDebugLogCount.Increment();
+					if (DebugIndex <= 40 || (DebugIndex <= 1000 && DebugIndex % 100 == 0))
+					{
+						UE_LOG(LogBlackmagicMedia, Display, TEXT("DeckLink input audio debug: device %d received %d int32 values, %d channel(s), %d Hz, %d byte(s), abs sum %lld, peak %lld."),
+							ChannelInfo.DeviceIndex, AudioValueCount, InFrameInfo.NumberOfAudioChannel, InFrameInfo.AudioRate, InFrameInfo.AudioBufferSize, AbsSum, Peak);
+					}
+
+					FBlackmagicMediaAudioBridge::PushInputAudio(ChannelInfo.DeviceIndex, AudioBuffer, AudioValueCount, InFrameInfo.NumberOfAudioChannel, InFrameInfo.AudioRate);
+
 					auto AudioSamle = MediaPlayer->AudioSamplePool->AcquireShared();
-					if (AudioSamle->Initialize(reinterpret_cast<int32*>(InFrameInfo.AudioBuffer)
-						, InFrameInfo.AudioBufferSize / sizeof(int32)
+					if (AudioSamle->Initialize(AudioBuffer
+						, AudioValueCount
 						, InFrameInfo.NumberOfAudioChannel
 						, InFrameInfo.AudioRate
 						, DecodedTime
@@ -265,7 +289,7 @@ namespace BlackmagicMediaPlayerHelpers
 					{
 						MediaPlayer->AddAudioSample(AudioSamle);
 
-						LastBitsPerSample = sizeof(int32);
+						LastBitsPerSample = sizeof(int32) * 8;
 						LastSampleRate = InFrameInfo.AudioRate;
 						LastNumChannels = InFrameInfo.NumberOfAudioChannel;
 					}

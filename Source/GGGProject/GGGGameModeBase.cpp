@@ -25,6 +25,7 @@
 #include "MediaCapture.h"
 #include "MediaIOCoreDefinitions.h"
 #include "MediaPlayer.h"
+#include "MediaSoundComponent.h"
 #include "MediaTexture.h"
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
@@ -97,6 +98,12 @@ bool IsEquivalentFrameRate(const FFrameRate& FrameRate, int32 Numerator, int32 D
 		&& Denominator != 0
 		&& static_cast<int64>(FrameRate.Numerator) * Denominator == static_cast<int64>(Numerator) * FrameRate.Denominator;
 }
+
+const FVector DeckLinkInputPlateDefaultLocation(0.0f, 0.0f, 120.0f);
+const FRotator DeckLinkInputPlateDefaultRotation(0.0f, 45.0f, 65.0f);
+const FVector DeckLinkInputPlateDefaultScale(4.2f, 2.3625f, 1.0f);
+constexpr float DeckLinkInputPlateMinScale = 0.2f;
+constexpr float DeckLinkInputPlateMaxScale = 5.0f;
 }
 
 AGGGGameModeBase::AGGGGameModeBase()
@@ -105,7 +112,7 @@ AGGGGameModeBase::AGGGGameModeBase()
 	HUDClass = AGGGPreviewHUD::StaticClass();
 	PrimaryActorTick.bCanEverTick = true;
 
-	static ConstructorHelpers::FObjectFinder<UStaticMesh> DisplayMeshFinder(TEXT("/Engine/BasicShapes/Cube.Cube"));
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> DisplayMeshFinder(TEXT("/Engine/BasicShapes/Plane.Plane"));
 	DeckLinkInputDisplayMesh = DisplayMeshFinder.Object;
 
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> ScreenMaterialFinder(TEXT("/Engine/EngineMaterials/Widget3DPassThrough_Opaque.Widget3DPassThrough_Opaque"));
@@ -133,7 +140,7 @@ void AGGGGameModeBase::ConfigureDeckLinkTiming()
 {
 	if (GEngine)
 	{
-		GEngine->SetMaxFPS(0.0f);
+		GEngine->SetMaxFPS(50.0f);
 
 		UGenlockedFixedRateCustomTimeStep* FixedRateStep = NewObject<UGenlockedFixedRateCustomTimeStep>(GEngine);
 		FixedRateStep->FrameRate = FFrameRate(50, 1);
@@ -227,6 +234,7 @@ void AGGGGameModeBase::SetupSplitScreenCameras()
 		ControlledCameras.Add(Cast<ACameraActor>(OrderedCamera));
 	}
 	SelectedCameraIndex = 0;
+	bControllingDeckLinkInputPlate = false;
 	ShowCameraControlStatus();
 	UpdateSelectedViewportCamera();
 	UE_LOG(LogTemp, Display, TEXT("Viewport monitor grid is showing cameras 1-4 from the DeckLink render targets."));
@@ -257,6 +265,12 @@ void AGGGGameModeBase::HandleCameraControl(float DeltaSeconds)
 		return;
 	}
 
+	if (PlayerController->WasInputKeyJustPressed(EKeys::Five) && DeckLinkInputScreenActor && DeckLinkInputScreenMeshComponent)
+	{
+		bControllingDeckLinkInputPlate = true;
+		ShowDeckLinkInputPlateControlStatus();
+	}
+
 	const TPair<FKey, int32> CameraSelectKeys[] = {
 		TPair<FKey, int32>(EKeys::One, 0),
 		TPair<FKey, int32>(EKeys::Two, 1),
@@ -268,10 +282,17 @@ void AGGGGameModeBase::HandleCameraControl(float DeltaSeconds)
 	{
 		if (PlayerController->WasInputKeyJustPressed(CameraSelectKey.Key) && ControlledCameras.IsValidIndex(CameraSelectKey.Value))
 		{
+			bControllingDeckLinkInputPlate = false;
 			SelectedCameraIndex = CameraSelectKey.Value;
 			UpdateSelectedViewportCamera();
 			ShowCameraControlStatus();
 		}
+	}
+
+	if (bControllingDeckLinkInputPlate)
+	{
+		HandleDeckLinkInputPlateControl(PlayerController, DeltaSeconds);
+		return;
 	}
 
 	ACameraActor* SelectedCamera = ControlledCameras.IsValidIndex(SelectedCameraIndex) ? ControlledCameras[SelectedCameraIndex].Get() : nullptr;
@@ -315,11 +336,97 @@ void AGGGGameModeBase::HandleCameraControl(float DeltaSeconds)
 	}
 }
 
+void AGGGGameModeBase::HandleDeckLinkInputPlateControl(APlayerController* PlayerController, float DeltaSeconds)
+{
+	if (!PlayerController || !DeckLinkInputScreenActor || !DeckLinkInputScreenMeshComponent)
+	{
+		return;
+	}
+
+	const bool bFastMove = PlayerController->IsInputKeyDown(EKeys::LeftShift) || PlayerController->IsInputKeyDown(EKeys::RightShift);
+	const float MoveSpeed = bFastMove ? 900.0f : 250.0f;
+	const float RotateSpeed = bFastMove ? 120.0f : 40.0f;
+	const float ScaleSpeed = bFastMove ? 1.5f : 0.5f;
+
+	const FRotator PlateYaw(0.0f, DeckLinkInputScreenMeshComponent->GetComponentRotation().Yaw, 0.0f);
+	const FVector PlateForward = FRotationMatrix(PlateYaw).GetUnitAxis(EAxis::X);
+	const FVector PlateRight = FRotationMatrix(PlateYaw).GetUnitAxis(EAxis::Y);
+
+	FVector MoveDirection = FVector::ZeroVector;
+	MoveDirection += PlateForward * (PlayerController->IsInputKeyDown(EKeys::W) ? 1.0f : 0.0f);
+	MoveDirection -= PlateForward * (PlayerController->IsInputKeyDown(EKeys::S) ? 1.0f : 0.0f);
+	MoveDirection += PlateRight * (PlayerController->IsInputKeyDown(EKeys::D) ? 1.0f : 0.0f);
+	MoveDirection -= PlateRight * (PlayerController->IsInputKeyDown(EKeys::A) ? 1.0f : 0.0f);
+	MoveDirection += FVector::UpVector * (PlayerController->IsInputKeyDown(EKeys::E) ? 1.0f : 0.0f);
+	MoveDirection -= FVector::UpVector * (PlayerController->IsInputKeyDown(EKeys::Q) ? 1.0f : 0.0f);
+
+	if (!MoveDirection.IsNearlyZero())
+	{
+		DeckLinkInputScreenActor->AddActorWorldOffset(MoveDirection.GetSafeNormal() * MoveSpeed * DeltaSeconds, false);
+	}
+
+	FRotator RotationDelta = FRotator::ZeroRotator;
+	RotationDelta.Pitch += PlayerController->IsInputKeyDown(EKeys::Up) ? -1.0f : 0.0f;
+	RotationDelta.Pitch += PlayerController->IsInputKeyDown(EKeys::Down) ? 1.0f : 0.0f;
+	RotationDelta.Yaw += PlayerController->IsInputKeyDown(EKeys::Right) ? 1.0f : 0.0f;
+	RotationDelta.Yaw += PlayerController->IsInputKeyDown(EKeys::Left) ? -1.0f : 0.0f;
+	RotationDelta.Roll += PlayerController->IsInputKeyDown(EKeys::C) ? 1.0f : 0.0f;
+	RotationDelta.Roll += PlayerController->IsInputKeyDown(EKeys::Z) ? -1.0f : 0.0f;
+
+	if (!RotationDelta.IsNearlyZero())
+	{
+		DeckLinkInputScreenMeshComponent->AddRelativeRotation(RotationDelta * RotateSpeed * DeltaSeconds);
+	}
+
+	float ScaleDirection = 0.0f;
+	ScaleDirection += (PlayerController->IsInputKeyDown(EKeys::Equals) || PlayerController->IsInputKeyDown(EKeys::Add)) ? 1.0f : 0.0f;
+	ScaleDirection -= (PlayerController->IsInputKeyDown(EKeys::Hyphen) || PlayerController->IsInputKeyDown(EKeys::Subtract)) ? 1.0f : 0.0f;
+	if (!FMath::IsNearlyZero(ScaleDirection))
+	{
+		DeckLinkInputPlateScaleFactor = FMath::Clamp(
+			DeckLinkInputPlateScaleFactor + ScaleDirection * ScaleSpeed * DeltaSeconds,
+			DeckLinkInputPlateMinScale,
+			DeckLinkInputPlateMaxScale);
+		DeckLinkInputScreenMeshComponent->SetRelativeScale3D(DeckLinkInputPlateDefaultScale * DeckLinkInputPlateScaleFactor);
+	}
+
+	if (PlayerController->WasInputKeyJustPressed(EKeys::R))
+	{
+		ResetDeckLinkInputPlate();
+		ShowDeckLinkInputPlateControlStatus();
+	}
+}
+
+void AGGGGameModeBase::ResetDeckLinkInputPlate()
+{
+	if (DeckLinkInputScreenActor)
+	{
+		DeckLinkInputScreenActor->SetActorLocation(DeckLinkInputPlateDefaultLocation);
+		DeckLinkInputScreenActor->SetActorRotation(FRotator::ZeroRotator);
+	}
+
+	if (DeckLinkInputScreenMeshComponent)
+	{
+		DeckLinkInputScreenMeshComponent->SetRelativeRotation(DeckLinkInputPlateDefaultRotation);
+		DeckLinkInputScreenMeshComponent->SetRelativeScale3D(DeckLinkInputPlateDefaultScale);
+	}
+
+	DeckLinkInputPlateScaleFactor = 1.0f;
+}
+
 void AGGGGameModeBase::ShowCameraControlStatus() const
 {
 	if (GEngine)
 	{
 		GEngine->AddOnScreenDebugMessage(1001, 2.0f, FColor::Cyan, FString::Printf(TEXT("Controlling camera %d"), SelectedCameraIndex + 1));
+	}
+}
+
+void AGGGGameModeBase::ShowDeckLinkInputPlateControlStatus() const
+{
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(1001, 2.0f, FColor::Cyan, TEXT("Controlling DeckLink input plate"));
 	}
 }
 
@@ -411,7 +518,9 @@ void AGGGGameModeBase::SetupDeckLinkInputScreen()
 	DeckLinkInputMediaSource = NewObject<UBlackmagicMediaSource>(this, TEXT("DeckLinkInputDevice5Source"));
 	DeckLinkInputMediaSource->MediaConfiguration = InputConfiguration;
 	DeckLinkInputMediaSource->AutoDetectableTimecodeFormat = EMediaIOAutoDetectableTimecodeFormat::None;
-	DeckLinkInputMediaSource->bCaptureAudio = false;
+	DeckLinkInputMediaSource->bCaptureAudio = true;
+	DeckLinkInputMediaSource->AudioChannels = EBlackmagicMediaAudioChannel::Stereo2;
+	DeckLinkInputMediaSource->MaxNumAudioFrameBuffer = 32;
 	DeckLinkInputMediaSource->bCaptureVideo = true;
 	DeckLinkInputMediaSource->ColorFormat = EBlackmagicMediaSourceColorFormat::YUV8;
 	DeckLinkInputMediaSource->MaxNumVideoFrameBuffer = 8;
@@ -427,7 +536,7 @@ void AGGGGameModeBase::SetupDeckLinkInputScreen()
 	FActorSpawnParameters SpawnParameters;
 	SpawnParameters.Name = TEXT("DeckLinkInputDevice5Screen");
 	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-	DeckLinkInputScreenActor = World->SpawnActor<AActor>(AActor::StaticClass(), FVector(0.0f, 0.0f, 120.0f), FRotator::ZeroRotator, SpawnParameters);
+	DeckLinkInputScreenActor = World->SpawnActor<AActor>(AActor::StaticClass(), DeckLinkInputPlateDefaultLocation, FRotator::ZeroRotator, SpawnParameters);
 	if (!DeckLinkInputScreenActor)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("DeckLink input screen skipped: could not spawn the screen actor."));
@@ -439,6 +548,26 @@ void AGGGGameModeBase::SetupDeckLinkInputScreen()
 	DeckLinkInputScreenActor->AddInstanceComponent(DisplayRootComponent);
 	DisplayRootComponent->SetMobility(EComponentMobility::Movable);
 	DisplayRootComponent->RegisterComponent();
+
+	DeckLinkInputMediaSoundComponent = NewObject<UMediaSoundComponent>(DeckLinkInputScreenActor, TEXT("DeckLinkInputDevice5Audio"));
+	if (DeckLinkInputMediaSoundComponent)
+	{
+		DeckLinkInputMediaSoundComponent->SetupAttachment(DisplayRootComponent);
+		DeckLinkInputMediaSoundComponent->SetMediaPlayer(DeckLinkInputMediaPlayer);
+		DeckLinkInputMediaSoundComponent->Channels = EMediaSoundChannels::Stereo;
+		DeckLinkInputMediaSoundComponent->DynamicRateAdjustment = true;
+		DeckLinkInputMediaSoundComponent->bAllowSpatialization = false;
+		DeckLinkInputMediaSoundComponent->bIsUISound = true;
+		DeckLinkInputMediaSoundComponent->SetAutoActivate(true);
+		DeckLinkInputScreenActor->AddInstanceComponent(DeckLinkInputMediaSoundComponent);
+		DeckLinkInputMediaSoundComponent->RegisterComponent();
+		DeckLinkInputMediaSoundComponent->CreateAudioComponent();
+		DeckLinkInputMediaSoundComponent->Initialize(48000);
+		DeckLinkInputMediaSoundComponent->SetVolumeMultiplier(1.0f);
+		DeckLinkInputMediaSoundComponent->Start();
+		DeckLinkInputMediaSoundComponent->Activate(true);
+		DeckLinkInputMediaSoundComponent->AddClockSink();
+	}
 
 	if (!DeckLinkInputDisplayMesh || !DeckLinkInputScreenMaterial)
 	{
@@ -454,7 +583,70 @@ void AGGGGameModeBase::SetupDeckLinkInputScreen()
 		return;
 	}
 
-	UE_LOG(LogTemp, Display, TEXT("DeckLink input device %d is placed in the scene as a visible video screen for all cameras."), DeckLinkInputDeviceId);
+	DeckLinkInputAudioKickAttempts = 0;
+	KickDeckLinkInputAudio();
+	World->GetTimerManager().SetTimer(DeckLinkInputAudioKickTimerHandle, this, &AGGGGameModeBase::KickDeckLinkInputAudio, 0.25f, true);
+
+	UE_LOG(LogTemp, Display, TEXT("DeckLink input device %d is placed in the scene as a visible video screen with stereo audio routed into Unreal."), DeckLinkInputDeviceId);
+}
+
+void AGGGGameModeBase::KickDeckLinkInputAudio()
+{
+	++DeckLinkInputAudioKickAttempts;
+
+	bool bAudioTrackReady = false;
+	int32 NumAudioTracks = 0;
+	int32 SelectedAudioTrack = INDEX_NONE;
+	float MediaRate = 0.0f;
+	bool bMediaSoundPlaying = false;
+
+	if (DeckLinkInputMediaPlayer)
+	{
+		NumAudioTracks = DeckLinkInputMediaPlayer->GetNumTracks(EMediaPlayerTrack::Audio);
+		if (NumAudioTracks > 0)
+		{
+			SelectedAudioTrack = DeckLinkInputMediaPlayer->GetSelectedTrack(EMediaPlayerTrack::Audio);
+			if (SelectedAudioTrack == INDEX_NONE)
+			{
+				DeckLinkInputMediaPlayer->SelectTrack(EMediaPlayerTrack::Audio, 0);
+				SelectedAudioTrack = DeckLinkInputMediaPlayer->GetSelectedTrack(EMediaPlayerTrack::Audio);
+			}
+			bAudioTrackReady = SelectedAudioTrack != INDEX_NONE;
+		}
+
+		DeckLinkInputMediaPlayer->Play();
+		DeckLinkInputMediaPlayer->SetRate(1.0f);
+		MediaRate = DeckLinkInputMediaPlayer->GetRate();
+	}
+
+	if (DeckLinkInputMediaSoundComponent)
+	{
+		DeckLinkInputMediaSoundComponent->Start();
+		DeckLinkInputMediaSoundComponent->Activate(true);
+		DeckLinkInputMediaSoundComponent->UpdatePlayer();
+		bMediaSoundPlaying = DeckLinkInputMediaSoundComponent->IsPlaying();
+	}
+
+	if (bAudioTrackReady && !FMath::IsNearlyZero(MediaRate))
+	{
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().ClearTimer(DeckLinkInputAudioKickTimerHandle);
+		}
+
+		UE_LOG(LogTemp, Display, TEXT("DeckLink input audio track %d selected from %d track(s), media rate %.2f, media sound playing: %s."), SelectedAudioTrack, NumAudioTracks, MediaRate, bMediaSoundPlaying ? TEXT("yes") : TEXT("no"));
+		return;
+	}
+
+	if (DeckLinkInputAudioKickAttempts >= 20)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().ClearTimer(DeckLinkInputAudioKickTimerHandle);
+		}
+
+		UE_LOG(LogTemp, Warning, TEXT("DeckLink input audio track was not reported after %d attempts. Output audio may be silent until the source exposes audio."), DeckLinkInputAudioKickAttempts);
+	}
 }
 
 void AGGGGameModeBase::AddDeckLinkInputScreenMesh(AActor* ScreenActor, UMediaTexture* MediaTexture)
@@ -467,7 +659,8 @@ void AGGGGameModeBase::AddDeckLinkInputScreenMesh(AActor* ScreenActor, UMediaTex
 	DeckLinkInputScreenMeshComponent = NewObject<UStaticMeshComponent>(ScreenActor, TEXT("DeckLinkInputScreenMesh"));
 	DeckLinkInputScreenMeshComponent->SetupAttachment(ScreenActor->GetRootComponent());
 	DeckLinkInputScreenMeshComponent->SetStaticMesh(DeckLinkInputDisplayMesh);
-	DeckLinkInputScreenMeshComponent->SetRelativeScale3D(FVector(4.2f, 2.4f, 2.3625f));
+	DeckLinkInputScreenMeshComponent->SetRelativeRotation(DeckLinkInputPlateDefaultRotation);
+	DeckLinkInputScreenMeshComponent->SetRelativeScale3D(DeckLinkInputPlateDefaultScale);
 	DeckLinkInputScreenMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	DeckLinkInputScreenMeshComponent->SetGenerateOverlapEvents(false);
 	DeckLinkInputScreenMeshComponent->SetCastShadow(false);
@@ -609,7 +802,10 @@ void AGGGGameModeBase::SetupDeckLinkOutputs(const TArray<AActor*>& OrderedCamera
 
 		MediaOutput->PixelFormat = EBlackmagicMediaOutputPixelFormat::PF_10BIT_YUV;
 		MediaOutput->TimecodeFormat = EMediaIOTimecodeFormat::None;
-		MediaOutput->bOutputAudio = false;
+		MediaOutput->AudioSampleRate = EBlackmagicMediaOutputAudioSampleRate::SR_48k;
+		MediaOutput->OutputChannelCount = EBlackmagicMediaAudioOutputChannelCount::CH_2;
+		MediaOutput->AudioBitDepth = EBlackmagicMediaOutputAudioBitDepth::Signed_16Bits;
+		MediaOutput->bOutputAudio = true;
 		MediaOutput->bLogDropFrame = true;
 		MediaOutput->bUseMultithreadedScheduling = false;
 		MediaOutput->bWaitForSyncEvent = false;
@@ -630,7 +826,7 @@ void AGGGGameModeBase::SetupDeckLinkOutputs(const TArray<AActor*>& OrderedCamera
 			continue;
 		}
 
-		UE_LOG(LogTemp, Display, TEXT("Camera %d is outputting to DeckLink device %d as 1080i50 10-bit YUV."), Index + 1, DeckLinkDeviceId);
+		UE_LOG(LogTemp, Display, TEXT("Camera %d is outputting to DeckLink device %d as 1080i50 10-bit YUV with stereo audio."), Index + 1, DeckLinkDeviceId);
 	}
 }
 

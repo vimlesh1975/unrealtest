@@ -3,6 +3,7 @@
 #include "BlackmagicMediaCapture.h"
 
 #include "BlackmagicLib.h"
+#include "BlackmagicMediaAudioBridge.h"
 #include "BlackmagicMediaOutput.h"
 #include "BlackmagicMediaOutputModule.h"
 #include "ColorSpace.h"
@@ -11,6 +12,7 @@
 #include "Engine/Engine.h"
 #include "HAL/Event.h"
 #include "HAL/IConsoleManager.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "IBlackmagicMediaModule.h"
 #include "MediaIOCoreSubsystem.h"
 #include "MediaIOCoreFileWriter.h"
@@ -451,6 +453,8 @@ bool UBlackmagicMediaCapture::UpdateAudioDeviceImpl(const FAudioDeviceHandle& In
 
 void UBlackmagicMediaCapture::StopCaptureImpl(bool bAllowPendingFrameToBeProcess)
 {
+	FBlackmagicMediaAudioBridge::UnregisterOutputReader(this);
+
 	if (!bAllowPendingFrameToBeProcess)
 	{
 		{
@@ -892,14 +896,12 @@ void UBlackmagicMediaCapture::OutputAudio_AnyThread(const FCaptureBaseData& InBa
 {
 	if (bOutputAudio)
 	{
+		static FThreadSafeCounter AudioDebugLogCount;
+
 		TRACE_CPUPROFILER_EVENT_SCOPE(UBlackmagicMediaCapture::OutputAudio);
 
 		// Take a local copy of the audio output in case it is switched from the main thread.
 		const TSharedPtr<FMediaIOAudioOutput> LocalAudioOutput = AudioOutput;
-		if(!LocalAudioOutput)
-		{
-			return;
-		}
 
 		const double NewTimestamp = FPlatformTime::Seconds();
 		double CurrentFrameTime = NewTimestamp - OutputAudioTimestamp;
@@ -912,28 +914,101 @@ void UBlackmagicMediaCapture::OutputAudio_AnyThread(const FCaptureBaseData& InBa
 
 		float FrameTimeRatio = CurrentFrameTime / TargetFrametime;
 
-		uint32_t NumSamplesToPull = FrameTimeRatio * LocalAudioOutput->NumSamplesPerFrame;
-		NumSamplesToPull = FMath::Clamp<uint32_t>(NumSamplesToPull, 0, LocalAudioOutput->NumSamplesPerFrame);
+		check(NumOutputChannels != 0);
+		const uint32_t OutputValuesPerFrame = LocalAudioOutput
+			? LocalAudioOutput->NumSamplesPerFrame
+			: static_cast<uint32_t>(FMath::CeilToInt(NumOutputChannels * 48000.0 / FrameRate.AsDecimal()));
+		uint32_t NumSamplesToPull = FrameTimeRatio * OutputValuesPerFrame;
+		NumSamplesToPull = FMath::Clamp<uint32_t>(NumSamplesToPull, 0, OutputValuesPerFrame);
+		const int32 NumAudioFramesToPull = FMath::Max<int32>(1, static_cast<int32>(NumSamplesToPull) / NumOutputChannels);
 
 		BlackmagicDesign::FAudioSamplesDescriptor AudioSamples;
 		AudioSamples.Timecode = InTimecode;
 		AudioSamples.FrameIdentifier = InBaseData.SourceFrameNumber;
-		check(NumOutputChannels != 0);
 		
 		if (AudioBitDepth == EBlackmagicMediaOutputAudioBitDepth::Signed_32Bits)
 		{
-			TArray<int32> AudioBuffer = LocalAudioOutput->GetAllAudioSamples<int32>();
+			TArray<int32> AudioBuffer;
+			const bool bUsedInputBridge = FBlackmagicMediaAudioBridge::PullAudioForOutput(this, NumAudioFramesToPull, NumOutputChannels, AudioBuffer);
+			if (!bUsedInputBridge)
+			{
+				if (!LocalAudioOutput)
+				{
+					return;
+				}
+				AudioBuffer = LocalAudioOutput->GetAllAudioSamples<int32>();
+			}
+
 			AudioSamples.AudioBuffer = reinterpret_cast<uint8_t*>(AudioBuffer.GetData());
 			AudioSamples.NumAudioSamples = AudioBuffer.Num() / NumOutputChannels;
 			AudioSamples.AudioBufferLength = AudioBuffer.Num() * sizeof(int32);
+
+			{
+				int64 AbsSum = 0;
+				int64 Peak = 0;
+				for (const int32 Sample : AudioBuffer)
+				{
+					const int64 Value = Sample;
+					const int64 AbsValue = Value < 0 ? -Value : Value;
+					AbsSum += AbsValue;
+					Peak = FMath::Max(Peak, AbsValue);
+				}
+
+				const int32 DebugIndex = AudioDebugLogCount.Increment();
+				if (DebugIndex <= 80 || (DebugIndex <= 1000 && DebugIndex % 50 == 0))
+				{
+					UE_LOG(LogBlackmagicMediaOutput, Display, TEXT("DeckLink audio debug: %s pulled %d int32 values from %s, %d frame(s), %d byte(s), abs sum %lld, peak %lld, frame %llu."),
+						*GetNameSafe(this), AudioBuffer.Num(), bUsedInputBridge ? TEXT("device5 bridge") : TEXT("engine mixer"), AudioSamples.NumAudioSamples, AudioSamples.AudioBufferLength, AbsSum, Peak, InBaseData.SourceFrameNumber);
+				}
+			}
+
 			EventCallback->SendAudioSamples(AudioSamples);
 		}
 		else if (AudioBitDepth == EBlackmagicMediaOutputAudioBitDepth::Signed_16Bits)
 		{
-			TArray<int16> AudioBuffer = LocalAudioOutput->GetAllAudioSamples<int16>();
+			TArray<int32> BridgedAudioBuffer;
+			const bool bUsedInputBridge = FBlackmagicMediaAudioBridge::PullAudioForOutput(this, NumAudioFramesToPull, NumOutputChannels, BridgedAudioBuffer);
+
+			TArray<int16> AudioBuffer;
+			if (bUsedInputBridge)
+			{
+				AudioBuffer.SetNumUninitialized(BridgedAudioBuffer.Num());
+				for (int32 SampleIndex = 0; SampleIndex < BridgedAudioBuffer.Num(); ++SampleIndex)
+				{
+					const int64 ConvertedSample = static_cast<int64>(BridgedAudioBuffer[SampleIndex]) / 65536;
+					AudioBuffer[SampleIndex] = static_cast<int16>(FMath::Clamp<int64>(ConvertedSample, TNumericLimits<int16>::Min(), TNumericLimits<int16>::Max()));
+				}
+			}
+			else
+			{
+				if (!LocalAudioOutput)
+				{
+					return;
+				}
+				AudioBuffer = LocalAudioOutput->GetAllAudioSamples<int16>();
+			}
+
 			AudioSamples.AudioBuffer = reinterpret_cast<uint8_t*>(AudioBuffer.GetData());
 			AudioSamples.NumAudioSamples = AudioBuffer.Num() / NumOutputChannels;
 			AudioSamples.AudioBufferLength = AudioBuffer.Num() * sizeof(int16);
+
+			{
+				int64 AbsSum = 0;
+				int32 Peak = 0;
+				for (const int16 Sample : AudioBuffer)
+				{
+					const int32 AbsValue = FMath::Abs(static_cast<int32>(Sample));
+					AbsSum += AbsValue;
+					Peak = FMath::Max(Peak, AbsValue);
+				}
+
+				const int32 DebugIndex = AudioDebugLogCount.Increment();
+				if (DebugIndex <= 80 || (DebugIndex <= 1000 && DebugIndex % 50 == 0))
+				{
+					UE_LOG(LogBlackmagicMediaOutput, Display, TEXT("DeckLink audio debug: %s pulled %d int16 values from %s, %d frame(s), %d byte(s), abs sum %lld, peak %d, frame %llu."),
+						*GetNameSafe(this), AudioBuffer.Num(), bUsedInputBridge ? TEXT("device5 bridge") : TEXT("engine mixer"), AudioSamples.NumAudioSamples, AudioSamples.AudioBufferLength, AbsSum, Peak, InBaseData.SourceFrameNumber);
+				}
+			}
 
 			EventCallback->SendAudioSamples(AudioSamples);
 		}

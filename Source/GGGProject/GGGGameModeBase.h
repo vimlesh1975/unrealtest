@@ -3,10 +3,12 @@
 #include "CoreMinimal.h"
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/HUD.h"
+#include "TimerManager.h"
 #include "GGGGameModeBase.generated.h"
 
 class AActor;
 class ACameraActor;
+class APlayerController;
 class ASceneCapture2D;
 class UBlackmagicMediaSource;
 class UMaterialInterface;
@@ -14,6 +16,7 @@ class UMediaCapture;
 class UBlackmagicMediaOutput;
 class UEngineCustomTimeStep;
 class UMediaPlayer;
+class UMediaSoundComponent;
 class UMediaTexture;
 class USceneCaptureComponent2D;
 class UStaticMesh;
@@ -48,14 +51,18 @@ private:
 	void ConfigureDeckLinkTiming();
 	void SetupSplitScreenCameras();
 	void SetupDeckLinkInputScreen();
+	void KickDeckLinkInputAudio();
 	void SetupDeckLinkOutputs(const TArray<AActor*>& OrderedCameras);
 	void AddDeckLinkInputScreenMesh(AActor* ScreenActor, UMediaTexture* MediaTexture);
 	void HandleCameraControl(float DeltaSeconds);
+	void HandleDeckLinkInputPlateControl(APlayerController* PlayerController, float DeltaSeconds);
+	void ResetDeckLinkInputPlate();
 	void SyncDeckLinkCaptures();
 	void SyncDeckLinkCapture(int32 CameraIndex, bool bCaptureScene);
 	void UpdateSelectedViewportCamera();
 	void LogDeckLinkOutputConfigurations() const;
 	void ShowCameraControlStatus() const;
+	void ShowDeckLinkInputPlateControlStatus() const;
 	bool FindDeckLinkInputConfiguration(int32 DeviceIdentifier, FMediaIOConfiguration& OutConfiguration) const;
 	bool FindDeckLinkOutputConfiguration(int32 DeviceIdentifier, FMediaIOOutputConfiguration& OutConfiguration) const;
 
@@ -93,10 +100,16 @@ private:
 	TObjectPtr<UMediaTexture> DeckLinkInputMediaTexture;
 
 	UPROPERTY(Transient)
+	TObjectPtr<UMediaSoundComponent> DeckLinkInputMediaSoundComponent;
+
+	UPROPERTY(Transient)
 	TObjectPtr<AActor> DeckLinkInputScreenActor;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UStaticMeshComponent> DeckLinkInputScreenMeshComponent;
+
+	FTimerHandle DeckLinkInputAudioKickTimerHandle;
+	int32 DeckLinkInputAudioKickAttempts = 0;
 
 	UPROPERTY()
 	TObjectPtr<UStaticMesh> DeckLinkInputDisplayMesh;
@@ -105,4 +118,6 @@ private:
 	TObjectPtr<UMaterialInterface> DeckLinkInputScreenMaterial;
 
 	int32 SelectedCameraIndex = 0;
+	bool bControllingDeckLinkInputPlate = false;
+	float DeckLinkInputPlateScaleFactor = 1.0f;
 };
