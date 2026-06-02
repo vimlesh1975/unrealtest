@@ -7,16 +7,28 @@
 #include "Camera/CameraComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Components/SceneComponent.h"
+#include "Components/PointLightComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Containers/StringConv.h"
+#include "Dom/JsonObject.h"
 #include "Engine/Engine.h"
 #include "Engine/Canvas.h"
+#include "Engine/GameViewportClient.h"
+#include "Engine/PointLight.h"
 #include "Engine/SceneCapture2D.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "FileMediaSource.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/GameUserSettings.h"
 #include "GenlockedFixedRateCustomTimeStep.h"
 #include "HAL/IConsoleManager.h"
+#include "HttpResultCallback.h"
+#include "HttpServerModule.h"
+#include "HttpServerRequest.h"
+#include "HttpServerResponse.h"
+#include "IHttpRouter.h"
 #include "InputCoreTypes.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Kismet/GameplayStatics.h"
@@ -27,6 +39,11 @@
 #include "MediaPlayer.h"
 #include "MediaSoundComponent.h"
 #include "MediaTexture.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Misc/ScopeLock.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -99,11 +116,131 @@ bool IsEquivalentFrameRate(const FFrameRate& FrameRate, int32 Numerator, int32 D
 		&& static_cast<int64>(FrameRate.Numerator) * Denominator == static_cast<int64>(Numerator) * FrameRate.Denominator;
 }
 
-const FVector DeckLinkInputPlateDefaultLocation(0.0f, 0.0f, 120.0f);
-const FRotator DeckLinkInputPlateDefaultRotation(0.0f, 45.0f, 65.0f);
+const FVector StudioCameraFocusPoint(0.0f, 610.0f, 250.0f);
+const FVector DeckLinkInputPlateDefaultLocation(-280.0f, 610.0f, 255.0f);
+const FRotator DeckLinkInputPlateDefaultRotation(0.0f, 0.0f, 90.0f);
 const FVector DeckLinkInputPlateDefaultScale(4.2f, 2.3625f, 1.0f);
 constexpr float DeckLinkInputPlateMinScale = 0.2f;
 constexpr float DeckLinkInputPlateMaxScale = 5.0f;
+const TCHAR* ExpressLoopMediaRelativePath = TEXT("media/express_loop.mp4");
+const FVector ExpressLoopMediaPlateLocation(280.0f, 610.0f, 255.0f);
+const FRotator ExpressLoopMediaPlateRotation(0.0f, 0.0f, 90.0f);
+const FVector ExpressLoopMediaPlateScale(4.2f, 2.3625f, 1.0f);
+constexpr float ExpressLoopMediaPlateMinScale = 0.2f;
+constexpr float ExpressLoopMediaPlateMaxScale = 5.0f;
+
+float ClampControlDeltaSeconds(float DeltaSeconds)
+{
+	return FMath::Clamp(DeltaSeconds, 0.0f, 0.25f);
+}
+
+float ReadJsonNumber(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName, float DefaultValue = 0.0f)
+{
+	if (!Object.IsValid())
+	{
+		return DefaultValue;
+	}
+
+	double Value = DefaultValue;
+	return Object->TryGetNumberField(FieldName, Value) ? static_cast<float>(Value) : DefaultValue;
+}
+
+FString BuildVectorJson(const FVector& Value)
+{
+	return FString::Printf(TEXT("{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f}"), Value.X, Value.Y, Value.Z);
+}
+
+FString BuildRotatorJson(const FRotator& Value)
+{
+	return FString::Printf(TEXT("{\"pitch\":%.3f,\"yaw\":%.3f,\"roll\":%.3f}"), Value.Pitch, Value.Yaw, Value.Roll);
+}
+
+FString BuildJsonString(const FString& Value)
+{
+	FString EscapedValue;
+	EscapedValue.Reserve(Value.Len() + 8);
+	for (const TCHAR Character : Value)
+	{
+		switch (Character)
+		{
+		case TEXT('"'):
+			EscapedValue += TEXT("\\\"");
+			break;
+		case TEXT('\\'):
+			EscapedValue += TEXT("\\\\");
+			break;
+		case TEXT('\n'):
+			EscapedValue += TEXT("\\n");
+			break;
+		case TEXT('\r'):
+			EscapedValue += TEXT("\\r");
+			break;
+		case TEXT('\t'):
+			EscapedValue += TEXT("\\t");
+			break;
+		default:
+			if (Character < 0x20)
+			{
+				EscapedValue += FString::Printf(TEXT("\\u%04x"), static_cast<uint32>(Character));
+			}
+			else
+			{
+				EscapedValue.AppendChar(Character);
+			}
+			break;
+		}
+	}
+
+	return FString::Printf(TEXT("\"%s\""), *EscapedValue);
+}
+
+FString SanitizeUploadedFileName(const FString& UploadedFileName)
+{
+	FString CleanFileName = FPaths::GetCleanFilename(UploadedFileName);
+	CleanFileName.TrimStartAndEndInline();
+	if (CleanFileName.IsEmpty())
+	{
+		CleanFileName = TEXT("selected.mp4");
+	}
+
+	FString SanitizedFileName;
+	SanitizedFileName.Reserve(CleanFileName.Len());
+	for (const TCHAR Character : CleanFileName)
+	{
+		const bool bAllowed =
+			(Character >= TEXT('a') && Character <= TEXT('z'))
+			|| (Character >= TEXT('A') && Character <= TEXT('Z'))
+			|| (Character >= TEXT('0') && Character <= TEXT('9'))
+			|| Character == TEXT('.')
+			|| Character == TEXT('_')
+			|| Character == TEXT('-');
+
+		SanitizedFileName.AppendChar(bAllowed ? Character : TEXT('_'));
+	}
+
+	if (!SanitizedFileName.EndsWith(TEXT(".mp4"), ESearchCase::IgnoreCase))
+	{
+		SanitizedFileName += TEXT(".mp4");
+	}
+
+	return SanitizedFileName;
+}
+
+void ApplyMediaTextureToMaterial(UMaterialInstanceDynamic* DynamicMaterial, UMediaTexture* MediaTexture)
+{
+	if (!DynamicMaterial || !MediaTexture)
+	{
+		return;
+	}
+
+	DynamicMaterial->SetTextureParameterValue(TEXT("InputTexture"), MediaTexture);
+	DynamicMaterial->SetTextureParameterValue(TEXT("MediaTexture"), MediaTexture);
+	DynamicMaterial->SetTextureParameterValue(TEXT("SlateUI"), MediaTexture);
+	DynamicMaterial->SetVectorParameterValue(TEXT("Color"), FLinearColor::White);
+	DynamicMaterial->SetVectorParameterValue(TEXT("TintColorAndOpacity"), FLinearColor::White);
+	DynamicMaterial->SetScalarParameterValue(TEXT("Opacity"), 1.0f);
+	DynamicMaterial->SetScalarParameterValue(TEXT("OpacityFromTexture"), 1.0f);
+}
 }
 
 AGGGGameModeBase::AGGGGameModeBase()
@@ -115,8 +252,24 @@ AGGGGameModeBase::AGGGGameModeBase()
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> DisplayMeshFinder(TEXT("/Engine/BasicShapes/Plane.Plane"));
 	DeckLinkInputDisplayMesh = DisplayMeshFinder.Object;
 
-	static ConstructorHelpers::FObjectFinder<UMaterialInterface> ScreenMaterialFinder(TEXT("/Engine/EngineMaterials/Widget3DPassThrough_Opaque.Widget3DPassThrough_Opaque"));
-	DeckLinkInputScreenMaterial = ScreenMaterialFinder.Object;
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> MediaPlateMaterialFinder(TEXT("/MediaPlate/M_MediaPlate.M_MediaPlate"));
+	DeckLinkInputScreenMaterial = MediaPlateMaterialFinder.Object;
+	if (!DeckLinkInputScreenMaterial)
+	{
+		static ConstructorHelpers::FObjectFinder<UMaterialInterface> MediaPlaneMaterialFinder(TEXT("/MediaCompositing/DefaultMediaPlaneMaterial.DefaultMediaPlaneMaterial"));
+		DeckLinkInputScreenMaterial = MediaPlaneMaterialFinder.Object;
+	}
+	if (!DeckLinkInputScreenMaterial)
+	{
+		static ConstructorHelpers::FObjectFinder<UMaterialInterface> ScreenMaterialFinder(TEXT("/Engine/EngineMaterials/Widget3DPassThrough_Opaque.Widget3DPassThrough_Opaque"));
+		DeckLinkInputScreenMaterial = ScreenMaterialFinder.Object;
+	}
+
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> RoomMeshFinder(TEXT("/Engine/BasicShapes/Cube.Cube"));
+	StudioRoomMesh = RoomMeshFinder.Object;
+
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> RoomMaterialFinder(TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
+	StudioRoomMaterial = RoomMaterialFinder.Object;
 }
 
 const TArray<TObjectPtr<UTextureRenderTarget2D>>& AGGGGameModeBase::GetDeckLinkPreviewTargets() const
@@ -129,10 +282,65 @@ void AGGGGameModeBase::BeginPlay()
 	Super::BeginPlay();
 
 	ConfigureDeckLinkTiming();
+	ConfigureWindowAndMouse();
+	StartWebControlServer();
+	UpdateCachedWebControlState();
 
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().SetTimerForNextTick(this, &AGGGGameModeBase::SetupSplitScreenCameras);
+	}
+}
+
+void AGGGGameModeBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(DeckLinkInputAudioKickTimerHandle);
+	}
+
+	StopWebControlServer();
+	Super::EndPlay(EndPlayReason);
+}
+
+void AGGGGameModeBase::ConfigureWindowAndMouse()
+{
+	if (GEngine)
+	{
+		if (UGameUserSettings* GameUserSettings = GEngine->GetGameUserSettings())
+		{
+			GameUserSettings->SetFullscreenMode(EWindowMode::Windowed);
+			GameUserSettings->SetScreenResolution(FIntPoint(1280, 720));
+			GameUserSettings->ApplySettings(false);
+		}
+	}
+
+	if (GEngine && GEngine->GameViewport)
+	{
+		GEngine->GameViewport->SetMouseCaptureMode(EMouseCaptureMode::NoCapture);
+		GEngine->GameViewport->SetMouseLockMode(EMouseLockMode::DoNotLock);
+		GEngine->GameViewport->SetHideCursorDuringCapture(false);
+	}
+
+	UWorld* World = GetWorld();
+	APlayerController* PlayerController = World ? UGameplayStatics::GetPlayerController(World, 0) : nullptr;
+	if (PlayerController)
+	{
+		PlayerController->bShowMouseCursor = true;
+		PlayerController->bEnableClickEvents = true;
+		PlayerController->bEnableMouseOverEvents = true;
+
+		FInputModeGameAndUI InputMode;
+		InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+		InputMode.SetHideCursorDuringCapture(false);
+		PlayerController->SetInputMode(InputMode);
+	}
+
+	static bool bLoggedWindowMouseSetup = false;
+	if (!bLoggedWindowMouseSetup)
+	{
+		bLoggedWindowMouseSetup = true;
+		UE_LOG(LogTemp, Display, TEXT("Window/mouse: forced 1280x720 windowed mode with an unlocked visible cursor."));
 	}
 }
 
@@ -164,6 +372,143 @@ void AGGGGameModeBase::ConfigureDeckLinkTiming()
 	}
 }
 
+void AGGGGameModeBase::SetupStudioRoom()
+{
+	if (StudioRoomActors.Num() > 0)
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World || !StudioRoomMesh)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Studio room skipped: room mesh is unavailable."));
+		return;
+	}
+
+	AddStudioRoomSurface(TEXT("StudioBottomFloor"), FVector(0.0f, -250.0f, -12.0f), FVector(18.0f, 20.0f, 0.08f), FLinearColor(0.22f, 0.25f, 0.31f, 1.0f));
+	AddStudioRoomSurface(TEXT("StudioFrontScreenWall"), FVector(0.0f, 710.0f, 315.0f), FVector(18.0f, 0.08f, 6.6f), FLinearColor(0.36f, 0.13f, 0.16f, 1.0f));
+	AddStudioRoomSurface(TEXT("StudioCameraSideWall"), FVector(0.0f, -1250.0f, 315.0f), FVector(18.0f, 0.08f, 6.6f), FLinearColor(0.35f, 0.29f, 0.12f, 1.0f));
+	AddStudioRoomSurface(TEXT("StudioLeftWall"), FVector(-900.0f, -250.0f, 315.0f), FVector(0.08f, 20.0f, 6.6f), FLinearColor(0.11f, 0.24f, 0.43f, 1.0f));
+	AddStudioRoomSurface(TEXT("StudioRightWall"), FVector(900.0f, -250.0f, 315.0f), FVector(0.08f, 20.0f, 6.6f), FLinearColor(0.13f, 0.34f, 0.22f, 1.0f));
+	AddStudioRoomSurface(TEXT("StudioTopCeiling"), FVector(0.0f, -250.0f, 660.0f), FVector(18.0f, 20.0f, 0.08f), FLinearColor(0.30f, 0.21f, 0.39f, 1.0f));
+
+	AddStudioRoomLight(TEXT("StudioKeyLightLeft"), FVector(-360.0f, -430.0f, 560.0f), 9000.0f, 1800.0f);
+	AddStudioRoomLight(TEXT("StudioKeyLightRight"), FVector(360.0f, -430.0f, 560.0f), 9000.0f, 1800.0f);
+	AddStudioRoomLight(TEXT("StudioBackWallFill"), FVector(0.0f, 250.0f, 520.0f), 4500.0f, 1200.0f);
+
+	UE_LOG(LogTemp, Display, TEXT("Studio room: large color-coded room spawned with separate bottom, top, left, right, screen/front, and camera-side walls."));
+}
+
+void AGGGGameModeBase::AddStudioRoomSurface(const FName& SurfaceName, const FVector& Location, const FVector& Scale, const FLinearColor& Color)
+{
+	UWorld* World = GetWorld();
+	if (!World || !StudioRoomMesh)
+	{
+		return;
+	}
+
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Name = SurfaceName;
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	AActor* SurfaceActor = World->SpawnActor<AActor>(AActor::StaticClass(), Location, FRotator::ZeroRotator, SpawnParameters);
+	if (!SurfaceActor)
+	{
+		return;
+	}
+
+	USceneComponent* SurfaceRootComponent = NewObject<USceneComponent>(SurfaceActor, FName(*FString::Printf(TEXT("%sRoot"), *SurfaceName.ToString())));
+	SurfaceActor->SetRootComponent(SurfaceRootComponent);
+	SurfaceActor->AddInstanceComponent(SurfaceRootComponent);
+	SurfaceRootComponent->SetMobility(EComponentMobility::Static);
+	SurfaceRootComponent->SetWorldLocation(Location);
+	SurfaceRootComponent->SetWorldRotation(FRotator::ZeroRotator);
+	SurfaceRootComponent->RegisterComponent();
+
+	UStaticMeshComponent* SurfaceMeshComponent = NewObject<UStaticMeshComponent>(SurfaceActor, FName(*FString::Printf(TEXT("%sMesh"), *SurfaceName.ToString())));
+	SurfaceMeshComponent->SetupAttachment(SurfaceRootComponent);
+	SurfaceMeshComponent->SetStaticMesh(StudioRoomMesh);
+	SurfaceMeshComponent->SetRelativeScale3D(Scale);
+	SurfaceMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	SurfaceMeshComponent->SetGenerateOverlapEvents(false);
+	SurfaceMeshComponent->SetCastShadow(false);
+	SurfaceMeshComponent->bReceivesDecals = false;
+	SurfaceActor->AddInstanceComponent(SurfaceMeshComponent);
+	SurfaceMeshComponent->RegisterComponent();
+
+	if (StudioRoomMaterial)
+	{
+		UMaterialInstanceDynamic* DynamicMaterial = SurfaceMeshComponent->CreateAndSetMaterialInstanceDynamicFromMaterial(0, StudioRoomMaterial);
+		if (DynamicMaterial)
+		{
+			DynamicMaterial->SetVectorParameterValue(TEXT("Color"), Color);
+			DynamicMaterial->SetVectorParameterValue(TEXT("BaseColor"), Color);
+		}
+	}
+
+	StudioRoomActors.Add(SurfaceActor);
+}
+
+void AGGGGameModeBase::AddStudioRoomLight(const FName& LightName, const FVector& Location, float Intensity, float Radius)
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Name = LightName;
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	APointLight* LightActor = World->SpawnActor<APointLight>(Location, FRotator::ZeroRotator, SpawnParameters);
+	if (!LightActor)
+	{
+		return;
+	}
+
+	if (UPointLightComponent* LightComponent = LightActor->PointLightComponent)
+	{
+		LightComponent->SetIntensity(Intensity);
+		LightComponent->SetAttenuationRadius(Radius);
+		LightComponent->SetLightColor(FLinearColor(1.0f, 0.96f, 0.90f).ToFColor(true));
+		LightComponent->SetCastShadows(false);
+	}
+
+	StudioRoomActors.Add(LightActor);
+}
+
+void AGGGGameModeBase::ArrangeStudioCameras(const TArray<AActor*>& OrderedCameras)
+{
+	static const FVector CameraLocations[] = {
+		FVector(0.0f, -1060.0f, 250.0f),
+		FVector(-280.0f, -980.0f, 245.0f),
+		FVector(280.0f, -980.0f, 245.0f),
+		FVector(0.0f, -880.0f, 430.0f)
+	};
+
+	for (int32 Index = 0; Index < UE_ARRAY_COUNT(CameraLocations); ++Index)
+	{
+		ACameraActor* CameraActor = OrderedCameras.IsValidIndex(Index) ? Cast<ACameraActor>(OrderedCameras[Index]) : nullptr;
+		if (!CameraActor)
+		{
+			continue;
+		}
+
+		const FVector& CameraLocation = CameraLocations[Index];
+		CameraActor->SetActorLocation(CameraLocation);
+		CameraActor->SetActorRotation(UKismetMathLibrary::FindLookAtRotation(CameraLocation, StudioCameraFocusPoint));
+
+		if (UCameraComponent* CameraComponent = CameraActor->GetCameraComponent())
+		{
+			CameraComponent->SetFieldOfView(62.0f);
+			CameraComponent->SetAspectRatio(16.0f / 9.0f);
+			CameraComponent->bConstrainAspectRatio = false;
+		}
+	}
+
+	UE_LOG(LogTemp, Display, TEXT("Studio cameras: cameras 1-4 placed in front of the back wall with slightly different angles."));
+}
+
 void AGGGGameModeBase::SetupSplitScreenCameras()
 {
 	static constexpr int32 DesiredViewCount = 4;
@@ -174,6 +519,8 @@ void AGGGGameModeBase::SetupSplitScreenCameras()
 		return;
 	}
 
+	SetupStudioRoom();
+
 	TArray<AActor*> Cameras;
 	UGameplayStatics::GetAllActorsOfClass(World, ACameraActor::StaticClass(), Cameras);
 	if (Cameras.Num() < DesiredViewCount)
@@ -182,12 +529,11 @@ void AGGGGameModeBase::SetupSplitScreenCameras()
 		return;
 	}
 
-	const FVector FocusPoint(0.0f, 0.0f, 60.0f);
 	for (AActor* Camera : Cameras)
 	{
 		if (Camera)
 		{
-			Camera->SetActorRotation(UKismetMathLibrary::FindLookAtRotation(Camera->GetActorLocation(), FocusPoint));
+			Camera->SetActorRotation(UKismetMathLibrary::FindLookAtRotation(Camera->GetActorLocation(), StudioCameraFocusPoint));
 		}
 	}
 
@@ -228,6 +574,8 @@ void AGGGGameModeBase::SetupSplitScreenCameras()
 		}
 	}
 
+	ArrangeStudioCameras(OrderedCameras);
+
 	ControlledCameras.Reset();
 	for (AActor* OrderedCamera : OrderedCameras)
 	{
@@ -235,11 +583,14 @@ void AGGGGameModeBase::SetupSplitScreenCameras()
 	}
 	SelectedCameraIndex = 0;
 	bControllingDeckLinkInputPlate = false;
+	bControllingExpressLoopMediaPlate = false;
 	ShowCameraControlStatus();
 	UpdateSelectedViewportCamera();
+	ConfigureWindowAndMouse();
 	UE_LOG(LogTemp, Display, TEXT("Viewport monitor grid is showing cameras 1-4 from the DeckLink render targets."));
 
 	SetupDeckLinkInputScreen();
+	SetupExpressLoopMediaPlate();
 	SetupDeckLinkOutputs(OrderedCameras);
 }
 
@@ -248,7 +599,10 @@ void AGGGGameModeBase::Tick(float DeltaSeconds)
 	Super::Tick(DeltaSeconds);
 
 	HandleCameraControl(DeltaSeconds);
+	ProcessWebControlCommands();
+	KeepExpressLoopMediaLooping();
 	SyncDeckLinkCaptures();
+	UpdateCachedWebControlState();
 }
 
 void AGGGGameModeBase::HandleCameraControl(float DeltaSeconds)
@@ -267,8 +621,12 @@ void AGGGGameModeBase::HandleCameraControl(float DeltaSeconds)
 
 	if (PlayerController->WasInputKeyJustPressed(EKeys::Five) && DeckLinkInputScreenActor && DeckLinkInputScreenMeshComponent)
 	{
-		bControllingDeckLinkInputPlate = true;
-		ShowDeckLinkInputPlateControlStatus();
+		SelectDeckLinkInputPlateControl(true);
+	}
+
+	if (PlayerController->WasInputKeyJustPressed(EKeys::Six) && ExpressLoopMediaPlateActor && ExpressLoopMediaPlateMeshComponent)
+	{
+		SelectExpressLoopMediaPlateControl(true);
 	}
 
 	const TPair<FKey, int32> CameraSelectKeys[] = {
@@ -282,16 +640,19 @@ void AGGGGameModeBase::HandleCameraControl(float DeltaSeconds)
 	{
 		if (PlayerController->WasInputKeyJustPressed(CameraSelectKey.Key) && ControlledCameras.IsValidIndex(CameraSelectKey.Value))
 		{
-			bControllingDeckLinkInputPlate = false;
-			SelectedCameraIndex = CameraSelectKey.Value;
-			UpdateSelectedViewportCamera();
-			ShowCameraControlStatus();
+			SelectCameraControl(CameraSelectKey.Value, true);
 		}
 	}
 
 	if (bControllingDeckLinkInputPlate)
 	{
 		HandleDeckLinkInputPlateControl(PlayerController, DeltaSeconds);
+		return;
+	}
+
+	if (bControllingExpressLoopMediaPlate)
+	{
+		HandleExpressLoopMediaPlateControl(PlayerController, DeltaSeconds);
 		return;
 	}
 
@@ -302,21 +663,11 @@ void AGGGGameModeBase::HandleCameraControl(float DeltaSeconds)
 	}
 
 	const bool bFastMove = PlayerController->IsInputKeyDown(EKeys::LeftShift) || PlayerController->IsInputKeyDown(EKeys::RightShift);
-	const float MoveSpeed = bFastMove ? 1200.0f : 300.0f;
-	const float RotateSpeed = bFastMove ? 90.0f : 30.0f;
 
-	FVector MoveDirection = FVector::ZeroVector;
-	MoveDirection += SelectedCamera->GetActorForwardVector() * (PlayerController->IsInputKeyDown(EKeys::W) ? 1.0f : 0.0f);
-	MoveDirection -= SelectedCamera->GetActorForwardVector() * (PlayerController->IsInputKeyDown(EKeys::S) ? 1.0f : 0.0f);
-	MoveDirection += SelectedCamera->GetActorRightVector() * (PlayerController->IsInputKeyDown(EKeys::D) ? 1.0f : 0.0f);
-	MoveDirection -= SelectedCamera->GetActorRightVector() * (PlayerController->IsInputKeyDown(EKeys::A) ? 1.0f : 0.0f);
-	MoveDirection += FVector::UpVector * (PlayerController->IsInputKeyDown(EKeys::E) ? 1.0f : 0.0f);
-	MoveDirection -= FVector::UpVector * (PlayerController->IsInputKeyDown(EKeys::Q) ? 1.0f : 0.0f);
-
-	if (!MoveDirection.IsNearlyZero())
-	{
-		SelectedCamera->AddActorWorldOffset(MoveDirection.GetSafeNormal() * MoveSpeed * DeltaSeconds, false);
-	}
+	const FVector MoveInput(
+		(PlayerController->IsInputKeyDown(EKeys::W) ? 1.0f : 0.0f) - (PlayerController->IsInputKeyDown(EKeys::S) ? 1.0f : 0.0f),
+		(PlayerController->IsInputKeyDown(EKeys::D) ? 1.0f : 0.0f) - (PlayerController->IsInputKeyDown(EKeys::A) ? 1.0f : 0.0f),
+		(PlayerController->IsInputKeyDown(EKeys::E) ? 1.0f : 0.0f) - (PlayerController->IsInputKeyDown(EKeys::Q) ? 1.0f : 0.0f));
 
 	FRotator RotationDelta = FRotator::ZeroRotator;
 	RotationDelta.Pitch += PlayerController->IsInputKeyDown(EKeys::Up) ? -1.0f : 0.0f;
@@ -324,15 +675,11 @@ void AGGGGameModeBase::HandleCameraControl(float DeltaSeconds)
 	RotationDelta.Yaw += PlayerController->IsInputKeyDown(EKeys::Right) ? 1.0f : 0.0f;
 	RotationDelta.Yaw += PlayerController->IsInputKeyDown(EKeys::Left) ? -1.0f : 0.0f;
 
-	if (!RotationDelta.IsNearlyZero())
-	{
-		SelectedCamera->AddActorWorldRotation(RotationDelta * RotateSpeed * DeltaSeconds);
-	}
+	ApplyCameraControl(SelectedCameraIndex, MoveInput, RotationDelta, bFastMove, DeltaSeconds);
 
 	if (PlayerController->WasInputKeyJustPressed(EKeys::R))
 	{
-		const FVector FocusPoint(0.0f, 0.0f, 60.0f);
-		SelectedCamera->SetActorRotation(UKismetMathLibrary::FindLookAtRotation(SelectedCamera->GetActorLocation(), FocusPoint));
+		AimCameraAtFocusPoint(SelectedCameraIndex);
 	}
 }
 
@@ -344,26 +691,10 @@ void AGGGGameModeBase::HandleDeckLinkInputPlateControl(APlayerController* Player
 	}
 
 	const bool bFastMove = PlayerController->IsInputKeyDown(EKeys::LeftShift) || PlayerController->IsInputKeyDown(EKeys::RightShift);
-	const float MoveSpeed = bFastMove ? 900.0f : 250.0f;
-	const float RotateSpeed = bFastMove ? 120.0f : 40.0f;
-	const float ScaleSpeed = bFastMove ? 1.5f : 0.5f;
-
-	const FRotator PlateYaw(0.0f, DeckLinkInputScreenMeshComponent->GetComponentRotation().Yaw, 0.0f);
-	const FVector PlateForward = FRotationMatrix(PlateYaw).GetUnitAxis(EAxis::X);
-	const FVector PlateRight = FRotationMatrix(PlateYaw).GetUnitAxis(EAxis::Y);
-
-	FVector MoveDirection = FVector::ZeroVector;
-	MoveDirection += PlateForward * (PlayerController->IsInputKeyDown(EKeys::W) ? 1.0f : 0.0f);
-	MoveDirection -= PlateForward * (PlayerController->IsInputKeyDown(EKeys::S) ? 1.0f : 0.0f);
-	MoveDirection += PlateRight * (PlayerController->IsInputKeyDown(EKeys::D) ? 1.0f : 0.0f);
-	MoveDirection -= PlateRight * (PlayerController->IsInputKeyDown(EKeys::A) ? 1.0f : 0.0f);
-	MoveDirection += FVector::UpVector * (PlayerController->IsInputKeyDown(EKeys::E) ? 1.0f : 0.0f);
-	MoveDirection -= FVector::UpVector * (PlayerController->IsInputKeyDown(EKeys::Q) ? 1.0f : 0.0f);
-
-	if (!MoveDirection.IsNearlyZero())
-	{
-		DeckLinkInputScreenActor->AddActorWorldOffset(MoveDirection.GetSafeNormal() * MoveSpeed * DeltaSeconds, false);
-	}
+	const FVector MoveInput(
+		(PlayerController->IsInputKeyDown(EKeys::W) ? 1.0f : 0.0f) - (PlayerController->IsInputKeyDown(EKeys::S) ? 1.0f : 0.0f),
+		(PlayerController->IsInputKeyDown(EKeys::D) ? 1.0f : 0.0f) - (PlayerController->IsInputKeyDown(EKeys::A) ? 1.0f : 0.0f),
+		(PlayerController->IsInputKeyDown(EKeys::E) ? 1.0f : 0.0f) - (PlayerController->IsInputKeyDown(EKeys::Q) ? 1.0f : 0.0f));
 
 	FRotator RotationDelta = FRotator::ZeroRotator;
 	RotationDelta.Pitch += PlayerController->IsInputKeyDown(EKeys::Up) ? -1.0f : 0.0f;
@@ -373,27 +704,219 @@ void AGGGGameModeBase::HandleDeckLinkInputPlateControl(APlayerController* Player
 	RotationDelta.Roll += PlayerController->IsInputKeyDown(EKeys::C) ? 1.0f : 0.0f;
 	RotationDelta.Roll += PlayerController->IsInputKeyDown(EKeys::Z) ? -1.0f : 0.0f;
 
-	if (!RotationDelta.IsNearlyZero())
-	{
-		DeckLinkInputScreenMeshComponent->AddRelativeRotation(RotationDelta * RotateSpeed * DeltaSeconds);
-	}
-
 	float ScaleDirection = 0.0f;
 	ScaleDirection += (PlayerController->IsInputKeyDown(EKeys::Equals) || PlayerController->IsInputKeyDown(EKeys::Add)) ? 1.0f : 0.0f;
 	ScaleDirection -= (PlayerController->IsInputKeyDown(EKeys::Hyphen) || PlayerController->IsInputKeyDown(EKeys::Subtract)) ? 1.0f : 0.0f;
-	if (!FMath::IsNearlyZero(ScaleDirection))
-	{
-		DeckLinkInputPlateScaleFactor = FMath::Clamp(
-			DeckLinkInputPlateScaleFactor + ScaleDirection * ScaleSpeed * DeltaSeconds,
-			DeckLinkInputPlateMinScale,
-			DeckLinkInputPlateMaxScale);
-		DeckLinkInputScreenMeshComponent->SetRelativeScale3D(DeckLinkInputPlateDefaultScale * DeckLinkInputPlateScaleFactor);
-	}
+	ApplyDeckLinkInputPlateControl(MoveInput, RotationDelta, ScaleDirection, bFastMove, DeltaSeconds);
 
 	if (PlayerController->WasInputKeyJustPressed(EKeys::R))
 	{
 		ResetDeckLinkInputPlate();
 		ShowDeckLinkInputPlateControlStatus();
+	}
+}
+
+void AGGGGameModeBase::HandleExpressLoopMediaPlateControl(APlayerController* PlayerController, float DeltaSeconds)
+{
+	if (!PlayerController || !ExpressLoopMediaPlateActor || !ExpressLoopMediaPlateMeshComponent)
+	{
+		return;
+	}
+
+	const bool bFastMove = PlayerController->IsInputKeyDown(EKeys::LeftShift) || PlayerController->IsInputKeyDown(EKeys::RightShift);
+	const FVector MoveInput(
+		(PlayerController->IsInputKeyDown(EKeys::W) ? 1.0f : 0.0f) - (PlayerController->IsInputKeyDown(EKeys::S) ? 1.0f : 0.0f),
+		(PlayerController->IsInputKeyDown(EKeys::D) ? 1.0f : 0.0f) - (PlayerController->IsInputKeyDown(EKeys::A) ? 1.0f : 0.0f),
+		(PlayerController->IsInputKeyDown(EKeys::E) ? 1.0f : 0.0f) - (PlayerController->IsInputKeyDown(EKeys::Q) ? 1.0f : 0.0f));
+
+	FRotator RotationDelta = FRotator::ZeroRotator;
+	RotationDelta.Pitch += PlayerController->IsInputKeyDown(EKeys::Up) ? -1.0f : 0.0f;
+	RotationDelta.Pitch += PlayerController->IsInputKeyDown(EKeys::Down) ? 1.0f : 0.0f;
+	RotationDelta.Yaw += PlayerController->IsInputKeyDown(EKeys::Right) ? 1.0f : 0.0f;
+	RotationDelta.Yaw += PlayerController->IsInputKeyDown(EKeys::Left) ? -1.0f : 0.0f;
+	RotationDelta.Roll += PlayerController->IsInputKeyDown(EKeys::C) ? 1.0f : 0.0f;
+	RotationDelta.Roll += PlayerController->IsInputKeyDown(EKeys::Z) ? -1.0f : 0.0f;
+
+	float ScaleDirection = 0.0f;
+	ScaleDirection += (PlayerController->IsInputKeyDown(EKeys::Equals) || PlayerController->IsInputKeyDown(EKeys::Add)) ? 1.0f : 0.0f;
+	ScaleDirection -= (PlayerController->IsInputKeyDown(EKeys::Hyphen) || PlayerController->IsInputKeyDown(EKeys::Subtract)) ? 1.0f : 0.0f;
+	ApplyExpressLoopMediaPlateControl(MoveInput, RotationDelta, ScaleDirection, bFastMove, DeltaSeconds);
+
+	if (PlayerController->WasInputKeyJustPressed(EKeys::R))
+	{
+		ResetExpressLoopMediaPlate();
+		ShowExpressLoopMediaPlateControlStatus();
+	}
+}
+
+void AGGGGameModeBase::SelectCameraControl(int32 CameraIndex, bool bShowStatus)
+{
+	if (!ControlledCameras.IsValidIndex(CameraIndex))
+	{
+		return;
+	}
+
+	bControllingDeckLinkInputPlate = false;
+	bControllingExpressLoopMediaPlate = false;
+	SelectedCameraIndex = CameraIndex;
+	UpdateSelectedViewportCamera();
+
+	if (bShowStatus)
+	{
+		ShowCameraControlStatus();
+	}
+}
+
+void AGGGGameModeBase::SelectDeckLinkInputPlateControl(bool bShowStatus)
+{
+	if (!DeckLinkInputScreenActor || !DeckLinkInputScreenMeshComponent)
+	{
+		return;
+	}
+
+	bControllingDeckLinkInputPlate = true;
+	bControllingExpressLoopMediaPlate = false;
+
+	if (bShowStatus)
+	{
+		ShowDeckLinkInputPlateControlStatus();
+	}
+}
+
+void AGGGGameModeBase::SelectExpressLoopMediaPlateControl(bool bShowStatus)
+{
+	if (!ExpressLoopMediaPlateActor || !ExpressLoopMediaPlateMeshComponent)
+	{
+		return;
+	}
+
+	bControllingDeckLinkInputPlate = false;
+	bControllingExpressLoopMediaPlate = true;
+
+	if (bShowStatus)
+	{
+		ShowExpressLoopMediaPlateControlStatus();
+	}
+}
+
+void AGGGGameModeBase::ApplyCameraControl(int32 CameraIndex, const FVector& MoveInput, const FRotator& RotationInput, bool bFastMove, float DeltaSeconds)
+{
+	ACameraActor* SelectedCamera = ControlledCameras.IsValidIndex(CameraIndex) ? ControlledCameras[CameraIndex].Get() : nullptr;
+	if (!SelectedCamera)
+	{
+		return;
+	}
+
+	const float ClampedDeltaSeconds = ClampControlDeltaSeconds(DeltaSeconds);
+	const float MoveSpeed = bFastMove ? 1200.0f : 300.0f;
+	const float RotateSpeed = bFastMove ? 90.0f : 30.0f;
+
+	FVector MoveDirection = FVector::ZeroVector;
+	MoveDirection += SelectedCamera->GetActorForwardVector() * MoveInput.X;
+	MoveDirection += SelectedCamera->GetActorRightVector() * MoveInput.Y;
+	MoveDirection += FVector::UpVector * MoveInput.Z;
+
+	if (!MoveDirection.IsNearlyZero())
+	{
+		SelectedCamera->AddActorWorldOffset(MoveDirection.GetSafeNormal() * MoveSpeed * ClampedDeltaSeconds, false);
+	}
+
+	if (!RotationInput.IsNearlyZero())
+	{
+		SelectedCamera->AddActorWorldRotation(RotationInput * RotateSpeed * ClampedDeltaSeconds);
+	}
+}
+
+void AGGGGameModeBase::AimCameraAtFocusPoint(int32 CameraIndex)
+{
+	ACameraActor* SelectedCamera = ControlledCameras.IsValidIndex(CameraIndex) ? ControlledCameras[CameraIndex].Get() : nullptr;
+	if (!SelectedCamera)
+	{
+		return;
+	}
+
+	SelectedCamera->SetActorRotation(UKismetMathLibrary::FindLookAtRotation(SelectedCamera->GetActorLocation(), StudioCameraFocusPoint));
+}
+
+void AGGGGameModeBase::ApplyDeckLinkInputPlateControl(const FVector& MoveInput, const FRotator& RotationInput, float ScaleDirection, bool bFastMove, float DeltaSeconds)
+{
+	if (!DeckLinkInputScreenActor || !DeckLinkInputScreenMeshComponent)
+	{
+		return;
+	}
+
+	const float ClampedDeltaSeconds = ClampControlDeltaSeconds(DeltaSeconds);
+	const float MoveSpeed = bFastMove ? 900.0f : 250.0f;
+	const float RotateSpeed = bFastMove ? 120.0f : 40.0f;
+	const float ScaleSpeed = bFastMove ? 1.5f : 0.5f;
+
+	const FRotator PlateYaw(0.0f, DeckLinkInputScreenMeshComponent->GetComponentRotation().Yaw, 0.0f);
+	const FVector PlateForward = FRotationMatrix(PlateYaw).GetUnitAxis(EAxis::X);
+	const FVector PlateRight = FRotationMatrix(PlateYaw).GetUnitAxis(EAxis::Y);
+
+	FVector MoveDirection = FVector::ZeroVector;
+	MoveDirection += PlateForward * MoveInput.X;
+	MoveDirection += PlateRight * MoveInput.Y;
+	MoveDirection += FVector::UpVector * MoveInput.Z;
+
+	if (!MoveDirection.IsNearlyZero())
+	{
+		DeckLinkInputScreenActor->AddActorWorldOffset(MoveDirection.GetSafeNormal() * MoveSpeed * ClampedDeltaSeconds, false);
+	}
+
+	if (!RotationInput.IsNearlyZero())
+	{
+		DeckLinkInputScreenMeshComponent->AddRelativeRotation(RotationInput * RotateSpeed * ClampedDeltaSeconds);
+	}
+
+	if (!FMath::IsNearlyZero(ScaleDirection))
+	{
+		DeckLinkInputPlateScaleFactor = FMath::Clamp(
+			DeckLinkInputPlateScaleFactor + ScaleDirection * ScaleSpeed * ClampedDeltaSeconds,
+			DeckLinkInputPlateMinScale,
+			DeckLinkInputPlateMaxScale);
+		DeckLinkInputScreenMeshComponent->SetRelativeScale3D(DeckLinkInputPlateDefaultScale * DeckLinkInputPlateScaleFactor);
+	}
+}
+
+void AGGGGameModeBase::ApplyExpressLoopMediaPlateControl(const FVector& MoveInput, const FRotator& RotationInput, float ScaleDirection, bool bFastMove, float DeltaSeconds)
+{
+	if (!ExpressLoopMediaPlateActor || !ExpressLoopMediaPlateMeshComponent)
+	{
+		return;
+	}
+
+	const float ClampedDeltaSeconds = ClampControlDeltaSeconds(DeltaSeconds);
+	const float MoveSpeed = bFastMove ? 900.0f : 250.0f;
+	const float RotateSpeed = bFastMove ? 120.0f : 40.0f;
+	const float ScaleSpeed = bFastMove ? 1.5f : 0.5f;
+
+	const FRotator PlateYaw(0.0f, ExpressLoopMediaPlateMeshComponent->GetComponentRotation().Yaw, 0.0f);
+	const FVector PlateForward = FRotationMatrix(PlateYaw).GetUnitAxis(EAxis::X);
+	const FVector PlateRight = FRotationMatrix(PlateYaw).GetUnitAxis(EAxis::Y);
+
+	FVector MoveDirection = FVector::ZeroVector;
+	MoveDirection += PlateForward * MoveInput.X;
+	MoveDirection += PlateRight * MoveInput.Y;
+	MoveDirection += FVector::UpVector * MoveInput.Z;
+
+	if (!MoveDirection.IsNearlyZero())
+	{
+		ExpressLoopMediaPlateActor->AddActorWorldOffset(MoveDirection.GetSafeNormal() * MoveSpeed * ClampedDeltaSeconds, false);
+	}
+
+	if (!RotationInput.IsNearlyZero())
+	{
+		ExpressLoopMediaPlateMeshComponent->AddRelativeRotation(RotationInput * RotateSpeed * ClampedDeltaSeconds);
+	}
+
+	if (!FMath::IsNearlyZero(ScaleDirection))
+	{
+		ExpressLoopMediaPlateScaleFactor = FMath::Clamp(
+			ExpressLoopMediaPlateScaleFactor + ScaleDirection * ScaleSpeed * ClampedDeltaSeconds,
+			ExpressLoopMediaPlateMinScale,
+			ExpressLoopMediaPlateMaxScale);
+		ExpressLoopMediaPlateMeshComponent->SetRelativeScale3D(ExpressLoopMediaPlateScale * ExpressLoopMediaPlateScaleFactor);
 	}
 }
 
@@ -414,6 +937,136 @@ void AGGGGameModeBase::ResetDeckLinkInputPlate()
 	DeckLinkInputPlateScaleFactor = 1.0f;
 }
 
+void AGGGGameModeBase::ResetExpressLoopMediaPlate()
+{
+	if (ExpressLoopMediaPlateActor)
+	{
+		ExpressLoopMediaPlateActor->SetActorLocation(ExpressLoopMediaPlateLocation);
+		ExpressLoopMediaPlateActor->SetActorRotation(FRotator::ZeroRotator);
+	}
+
+	if (ExpressLoopMediaPlateMeshComponent)
+	{
+		ExpressLoopMediaPlateMeshComponent->SetRelativeRotation(ExpressLoopMediaPlateRotation);
+		ExpressLoopMediaPlateMeshComponent->SetRelativeScale3D(ExpressLoopMediaPlateScale);
+	}
+
+	ExpressLoopMediaPlateScaleFactor = 1.0f;
+}
+
+FString AGGGGameModeBase::ResolveExpressLoopMediaFilePath(const FString& FilePath) const
+{
+	FString CleanPath = FilePath;
+	CleanPath.TrimStartAndEndInline();
+	if (CleanPath.StartsWith(TEXT("\"")) && CleanPath.EndsWith(TEXT("\"")) && CleanPath.Len() >= 2)
+	{
+		CleanPath = CleanPath.Mid(1, CleanPath.Len() - 2);
+		CleanPath.TrimStartAndEndInline();
+	}
+
+	if (CleanPath.IsEmpty())
+	{
+		CleanPath = ExpressLoopMediaRelativePath;
+	}
+
+	FString ResolvedPath = FPaths::IsRelative(CleanPath)
+		? FPaths::Combine(FPaths::ProjectContentDir(), CleanPath)
+		: CleanPath;
+
+	ResolvedPath = FPaths::ConvertRelativePathToFull(ResolvedPath);
+	FPaths::NormalizeFilename(ResolvedPath);
+	return ResolvedPath;
+}
+
+bool AGGGGameModeBase::OpenExpressLoopMediaFile(const FString& FilePath, bool bShowStatus)
+{
+	if (!ExpressLoopMediaSource || !ExpressLoopMediaPlayer)
+	{
+		ExpressLoopMediaStatus = TEXT("MP4 player is not ready yet.");
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *ExpressLoopMediaStatus);
+		return false;
+	}
+
+	const FString FullMediaPath = ResolveExpressLoopMediaFilePath(FilePath);
+	if (!FPaths::FileExists(FullMediaPath))
+	{
+		ExpressLoopMediaStatus = FString::Printf(TEXT("MP4 file not found: %s"), *FullMediaPath);
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *ExpressLoopMediaStatus);
+		if (GEngine && bShowStatus)
+		{
+			GEngine->AddOnScreenDebugMessage(1002, 3.0f, FColor::Red, ExpressLoopMediaStatus);
+		}
+		return false;
+	}
+
+	ExpressLoopMediaSource->SetFilePath(FullMediaPath);
+	ExpressLoopMediaSource->PrecacheFile = false;
+	ExpressLoopMediaPlayer->Close();
+	ExpressLoopMediaPlayer->SetLooping(true);
+	const bool bOpened = ExpressLoopMediaPlayer->OpenSource(ExpressLoopMediaSource);
+	if (!bOpened)
+	{
+		ExpressLoopMediaStatus = FString::Printf(TEXT("MP4 failed to open: %s"), *FullMediaPath);
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *ExpressLoopMediaStatus);
+		if (GEngine && bShowStatus)
+		{
+			GEngine->AddOnScreenDebugMessage(1002, 3.0f, FColor::Red, ExpressLoopMediaStatus);
+		}
+		return false;
+	}
+
+	ExpressLoopMediaPlayer->SetLooping(true);
+	ExpressLoopMediaPlayer->Play();
+	ExpressLoopMediaFilePath = FullMediaPath;
+	ExpressLoopMediaStatus = FString::Printf(TEXT("Playing %s"), *FullMediaPath);
+	UE_LOG(LogTemp, Display, TEXT("Express loop media plate is playing %s in loop."), *FullMediaPath);
+	if (GEngine && bShowStatus)
+	{
+		GEngine->AddOnScreenDebugMessage(1002, 3.0f, FColor::Cyan, FString::Printf(TEXT("MP4 loaded: %s"), *FPaths::GetCleanFilename(FullMediaPath)));
+	}
+	return true;
+}
+
+void AGGGGameModeBase::HandleExpressLoopMediaEndReached()
+{
+	RestartExpressLoopMediaPlayback(true);
+}
+
+void AGGGGameModeBase::RestartExpressLoopMediaPlayback(bool bFromEndReached)
+{
+	if (!ExpressLoopMediaPlayer || ExpressLoopMediaFilePath.IsEmpty())
+	{
+		return;
+	}
+
+	ExpressLoopMediaPlayer->SetLooping(true);
+	const bool bSeeked = ExpressLoopMediaPlayer->Seek(FTimespan::Zero()) || ExpressLoopMediaPlayer->Rewind();
+	const bool bPlaying = ExpressLoopMediaPlayer->Play();
+	ExpressLoopMediaPlayer->SetRate(1.0f);
+	ExpressLoopMediaStatus = FString::Printf(TEXT("Playing %s"), *ExpressLoopMediaFilePath);
+	UE_LOG(LogTemp, Display, TEXT("Express loop media plate loop restart%s: seek=%s play=%s."),
+		bFromEndReached ? TEXT(" after end") : TEXT(" from watchdog"),
+		bSeeked ? TEXT("yes") : TEXT("no"),
+		bPlaying ? TEXT("yes") : TEXT("no"));
+}
+
+void AGGGGameModeBase::KeepExpressLoopMediaLooping()
+{
+	if (!ExpressLoopMediaPlayer || ExpressLoopMediaFilePath.IsEmpty() || ExpressLoopMediaPlayer->IsPlaying())
+	{
+		return;
+	}
+
+	const FTimespan Duration = ExpressLoopMediaPlayer->GetDuration();
+	const FTimespan CurrentTime = ExpressLoopMediaPlayer->GetTime();
+	if (Duration <= FTimespan::Zero() || CurrentTime < Duration - FTimespan::FromMilliseconds(500.0))
+	{
+		return;
+	}
+
+	RestartExpressLoopMediaPlayback(false);
+}
+
 void AGGGGameModeBase::ShowCameraControlStatus() const
 {
 	if (GEngine)
@@ -427,6 +1080,14 @@ void AGGGGameModeBase::ShowDeckLinkInputPlateControlStatus() const
 	if (GEngine)
 	{
 		GEngine->AddOnScreenDebugMessage(1001, 2.0f, FColor::Cyan, TEXT("Controlling DeckLink input plate"));
+	}
+}
+
+void AGGGGameModeBase::ShowExpressLoopMediaPlateControlStatus() const
+{
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(1001, 2.0f, FColor::Cyan, TEXT("Controlling MP4 media plate"));
 	}
 }
 
@@ -455,6 +1116,927 @@ void AGGGGameModeBase::UpdateSelectedViewportCamera()
 		PlayerController->SetViewTarget(MonitorViewportCamera);
 		PlayerController->SetViewTargetWithBlend(MonitorViewportCamera, 0.0f);
 	}
+}
+
+void AGGGGameModeBase::StartWebControlServer()
+{
+	if (bWebControlServerStarted)
+	{
+		return;
+	}
+
+	FHttpServerModule& HttpServerModule = FHttpServerModule::Get();
+	HttpServerModule.StartAllListeners();
+
+	WebControlRouter = HttpServerModule.GetHttpRouter(WebControlPort, true);
+	if (!WebControlRouter.IsValid())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Web camera control could not bind to port %u. Is another app already using it?"), WebControlPort);
+		return;
+	}
+
+	TWeakObjectPtr<AGGGGameModeBase> WeakThis(this);
+	WebControlPageRouteHandle = WebControlRouter->BindRoute(FHttpPath(TEXT("/c")), EHttpServerRequestVerbs::VERB_GET,
+		[WeakThis](const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
+	{
+		AGGGGameModeBase* GameMode = WeakThis.Get();
+		if (!GameMode)
+		{
+			return false;
+		}
+
+		OnComplete(FHttpServerResponse::Create(GameMode->BuildWebControlPage(), TEXT("text/html; charset=utf-8")));
+		return true;
+	});
+
+	WebControlStateRouteHandle = WebControlRouter->BindRoute(FHttpPath(TEXT("/state")), EHttpServerRequestVerbs::VERB_GET,
+		[WeakThis](const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
+	{
+		AGGGGameModeBase* GameMode = WeakThis.Get();
+		if (!GameMode)
+		{
+			return false;
+		}
+
+		FString StateJson;
+		{
+			FScopeLock Lock(&GameMode->WebControlStateCriticalSection);
+			StateJson = GameMode->CachedWebControlStateJson;
+		}
+
+		if (StateJson.IsEmpty())
+		{
+			StateJson = TEXT("{\"selected\":{\"target\":\"camera\",\"cameraIndex\":0,\"cameraNumber\":1},\"cameras\":[],\"plate\":{\"available\":false},\"mp4\":{\"available\":false}}");
+		}
+
+		OnComplete(FHttpServerResponse::Create(StateJson, TEXT("application/json; charset=utf-8")));
+		return true;
+	});
+
+	WebControlCommandRouteHandle = WebControlRouter->BindRoute(FHttpPath(TEXT("/control")), EHttpServerRequestVerbs::VERB_POST,
+		[WeakThis](const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
+	{
+		AGGGGameModeBase* GameMode = WeakThis.Get();
+		if (!GameMode)
+		{
+			return false;
+		}
+
+		FString RequestBody;
+		if (Request.Body.Num() > 0)
+		{
+			FUTF8ToTCHAR ConvertedBody(reinterpret_cast<const ANSICHAR*>(Request.Body.GetData()), Request.Body.Num());
+			RequestBody = FString(ConvertedBody.Length(), ConvertedBody.Get());
+		}
+
+		FString ErrorMessage;
+		if (!GameMode->EnqueueWebControlCommandFromJson(RequestBody, ErrorMessage))
+		{
+			OnComplete(FHttpServerResponse::Error(EHttpServerResponseCodes::BadRequest, TEXT("bad_request"), ErrorMessage));
+			return true;
+		}
+
+		OnComplete(FHttpServerResponse::Create(TEXT("{\"ok\":true}"), TEXT("application/json; charset=utf-8")));
+		return true;
+	});
+
+	WebControlUploadRouteHandle = WebControlRouter->BindRoute(FHttpPath(TEXT("/uploadmp4")), EHttpServerRequestVerbs::VERB_POST,
+		[WeakThis](const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
+	{
+		AGGGGameModeBase* GameMode = WeakThis.Get();
+		if (!GameMode)
+		{
+			return false;
+		}
+
+		const FString* QueryFileName = Request.QueryParams.Find(TEXT("filename"));
+		const FString UploadedFileName = QueryFileName ? *QueryFileName : TEXT("selected.mp4");
+
+		FString SavedFilePath;
+		FString ErrorMessage;
+		if (!GameMode->SaveUploadedExpressLoopMediaFile(UploadedFileName, Request.Body, SavedFilePath, ErrorMessage))
+		{
+			OnComplete(FHttpServerResponse::Error(EHttpServerResponseCodes::BadRequest, TEXT("bad_request"), ErrorMessage));
+			return true;
+		}
+
+		FGGGWebControlCommand Command;
+		Command.Target = EGGGWebControlTarget::ExpressLoopMediaPlate;
+		Command.bSetFile = true;
+		Command.FilePath = SavedFilePath;
+		GameMode->PendingWebControlCommands.Enqueue(Command);
+
+		const FString ResponseJson = FString::Printf(
+			TEXT("{\"ok\":true,\"filePath\":%s,\"fileName\":%s}"),
+			*BuildJsonString(SavedFilePath),
+			*BuildJsonString(FPaths::GetCleanFilename(SavedFilePath)));
+		OnComplete(FHttpServerResponse::Create(ResponseJson, TEXT("application/json; charset=utf-8")));
+		return true;
+	});
+
+	if (!WebControlPageRouteHandle.IsValid() || !WebControlStateRouteHandle.IsValid() || !WebControlCommandRouteHandle.IsValid() || !WebControlUploadRouteHandle.IsValid())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Web camera control could not bind all routes on port %u."), WebControlPort);
+		StopWebControlServer();
+		return;
+	}
+
+	bWebControlServerStarted = true;
+	UE_LOG(LogTemp, Display, TEXT("Web camera control is available at http://<this-pc-ip>:%u/c."), WebControlPort);
+}
+
+void AGGGGameModeBase::StopWebControlServer()
+{
+	if (WebControlRouter.IsValid())
+	{
+		if (WebControlPageRouteHandle.IsValid())
+		{
+			WebControlRouter->UnbindRoute(WebControlPageRouteHandle);
+		}
+
+		if (WebControlStateRouteHandle.IsValid())
+		{
+			WebControlRouter->UnbindRoute(WebControlStateRouteHandle);
+		}
+
+		if (WebControlCommandRouteHandle.IsValid())
+		{
+			WebControlRouter->UnbindRoute(WebControlCommandRouteHandle);
+		}
+
+		if (WebControlUploadRouteHandle.IsValid())
+		{
+			WebControlRouter->UnbindRoute(WebControlUploadRouteHandle);
+		}
+	}
+
+	WebControlPageRouteHandle.Reset();
+	WebControlStateRouteHandle.Reset();
+	WebControlCommandRouteHandle.Reset();
+	WebControlUploadRouteHandle.Reset();
+	WebControlRouter.Reset();
+
+	if (bWebControlServerStarted && FHttpServerModule::IsAvailable())
+	{
+		FHttpServerModule::Get().StopAllListeners();
+	}
+
+	bWebControlServerStarted = false;
+}
+
+void AGGGGameModeBase::ProcessWebControlCommands()
+{
+	FGGGWebControlCommand Command;
+	while (PendingWebControlCommands.Dequeue(Command))
+	{
+		if (Command.Target == EGGGWebControlTarget::Camera)
+		{
+			if (!ControlledCameras.IsValidIndex(Command.CameraIndex))
+			{
+				continue;
+			}
+
+			SelectCameraControl(Command.CameraIndex, Command.bSelectOnly);
+			if (Command.bLookAt || Command.bReset)
+			{
+				AimCameraAtFocusPoint(Command.CameraIndex);
+			}
+
+			if (!Command.bSelectOnly)
+			{
+				ApplyCameraControl(Command.CameraIndex, Command.Move, Command.Rotation, Command.bFast, Command.DeltaSeconds);
+			}
+		}
+		else
+		{
+			if (Command.Target == EGGGWebControlTarget::DeckLinkInputPlate)
+			{
+				if (!DeckLinkInputScreenActor || !DeckLinkInputScreenMeshComponent)
+				{
+					continue;
+				}
+
+				SelectDeckLinkInputPlateControl(Command.bSelectOnly);
+				if (Command.bReset)
+				{
+					ResetDeckLinkInputPlate();
+					ShowDeckLinkInputPlateControlStatus();
+					continue;
+				}
+
+				if (!Command.bSelectOnly)
+				{
+					ApplyDeckLinkInputPlateControl(Command.Move, Command.Rotation, Command.Scale, Command.bFast, Command.DeltaSeconds);
+				}
+			}
+			else
+			{
+				if (!ExpressLoopMediaPlateActor || !ExpressLoopMediaPlateMeshComponent)
+				{
+					continue;
+				}
+
+				SelectExpressLoopMediaPlateControl(Command.bSelectOnly || Command.bSetFile);
+				if (Command.bSetFile)
+				{
+					OpenExpressLoopMediaFile(Command.FilePath, true);
+					continue;
+				}
+
+				if (Command.bReset)
+				{
+					ResetExpressLoopMediaPlate();
+					ShowExpressLoopMediaPlateControlStatus();
+					continue;
+				}
+
+				if (!Command.bSelectOnly)
+				{
+					ApplyExpressLoopMediaPlateControl(Command.Move, Command.Rotation, Command.Scale, Command.bFast, Command.DeltaSeconds);
+				}
+			}
+		}
+	}
+}
+
+bool AGGGGameModeBase::EnqueueWebControlCommandFromJson(const FString& RequestBody, FString& OutError)
+{
+	if (RequestBody.IsEmpty())
+	{
+		OutError = TEXT("Request body is empty.");
+		return false;
+	}
+
+	TSharedPtr<FJsonObject> JsonObject;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(RequestBody);
+	if (!FJsonSerializer::Deserialize(Reader, JsonObject) || !JsonObject.IsValid())
+	{
+		OutError = TEXT("Request body is not valid JSON.");
+		return false;
+	}
+
+	FGGGWebControlCommand Command;
+
+	FString TargetString;
+	if (JsonObject->TryGetStringField(TEXT("target"), TargetString))
+	{
+		const FString NormalizedTarget = TargetString.ToLower();
+		if (NormalizedTarget == TEXT("plate") || NormalizedTarget == TEXT("input") || NormalizedTarget == TEXT("decklinkinputplate"))
+		{
+			Command.Target = EGGGWebControlTarget::DeckLinkInputPlate;
+		}
+		else if (NormalizedTarget == TEXT("mp4") || NormalizedTarget == TEXT("media") || NormalizedTarget == TEXT("file") || NormalizedTarget == TEXT("express") || NormalizedTarget == TEXT("expressloopmediaplate"))
+		{
+			Command.Target = EGGGWebControlTarget::ExpressLoopMediaPlate;
+		}
+		else
+		{
+			Command.Target = EGGGWebControlTarget::Camera;
+		}
+	}
+	else
+	{
+		Command.Target = bControllingDeckLinkInputPlate
+			? EGGGWebControlTarget::DeckLinkInputPlate
+			: (bControllingExpressLoopMediaPlate ? EGGGWebControlTarget::ExpressLoopMediaPlate : EGGGWebControlTarget::Camera);
+	}
+
+	Command.CameraIndex = SelectedCameraIndex;
+	int32 CameraIndex = INDEX_NONE;
+	if (JsonObject->TryGetNumberField(TEXT("cameraIndex"), CameraIndex))
+	{
+		Command.CameraIndex = CameraIndex;
+	}
+	else if (JsonObject->TryGetNumberField(TEXT("index"), CameraIndex))
+	{
+		Command.CameraIndex = CameraIndex - 1;
+	}
+
+	if (Command.Target == EGGGWebControlTarget::Camera && (Command.CameraIndex < 0 || Command.CameraIndex > 3))
+	{
+		OutError = TEXT("Camera index must be 0-3, or index must be 1-4.");
+		return false;
+	}
+
+	bool bFast = false;
+	if (JsonObject->TryGetBoolField(TEXT("fast"), bFast))
+	{
+		Command.bFast = bFast;
+	}
+
+	double DeltaSeconds = Command.DeltaSeconds;
+	if (JsonObject->TryGetNumberField(TEXT("dt"), DeltaSeconds) || JsonObject->TryGetNumberField(TEXT("deltaSeconds"), DeltaSeconds))
+	{
+		Command.DeltaSeconds = ClampControlDeltaSeconds(static_cast<float>(DeltaSeconds));
+	}
+
+	FString ActionString;
+	if (JsonObject->TryGetStringField(TEXT("action"), ActionString))
+	{
+		const FString NormalizedAction = ActionString.ToLower();
+		Command.bSelectOnly = NormalizedAction == TEXT("select");
+		Command.bLookAt = NormalizedAction == TEXT("lookat") || NormalizedAction == TEXT("aim") || NormalizedAction == TEXT("aimcenter");
+		Command.bReset = NormalizedAction == TEXT("reset");
+		Command.bSetFile = NormalizedAction == TEXT("setfile") || NormalizedAction == TEXT("loadfile") || NormalizedAction == TEXT("setmp4") || NormalizedAction == TEXT("loadmp4");
+		if (Command.bSetFile)
+		{
+			Command.Target = EGGGWebControlTarget::ExpressLoopMediaPlate;
+		}
+	}
+
+	bool bBoolValue = false;
+	if (JsonObject->TryGetBoolField(TEXT("select"), bBoolValue))
+	{
+		Command.bSelectOnly = bBoolValue;
+	}
+	if (JsonObject->TryGetBoolField(TEXT("lookAt"), bBoolValue))
+	{
+		Command.bLookAt = bBoolValue;
+	}
+	if (JsonObject->TryGetBoolField(TEXT("reset"), bBoolValue))
+	{
+		Command.bReset = bBoolValue;
+	}
+	if (JsonObject->TryGetBoolField(TEXT("setFile"), bBoolValue))
+	{
+		Command.bSetFile = bBoolValue;
+		if (Command.bSetFile)
+		{
+			Command.Target = EGGGWebControlTarget::ExpressLoopMediaPlate;
+		}
+	}
+
+	if (Command.bSetFile)
+	{
+		if (!JsonObject->TryGetStringField(TEXT("filePath"), Command.FilePath)
+			&& !JsonObject->TryGetStringField(TEXT("path"), Command.FilePath)
+			&& !JsonObject->TryGetStringField(TEXT("file"), Command.FilePath))
+		{
+			OutError = TEXT("MP4 filePath is required.");
+			return false;
+		}
+
+		if (Command.FilePath.TrimStartAndEnd().IsEmpty())
+		{
+			OutError = TEXT("MP4 filePath is empty.");
+			return false;
+		}
+	}
+
+	const TSharedPtr<FJsonObject>* MoveObject = nullptr;
+	if (JsonObject->TryGetObjectField(TEXT("move"), MoveObject) && MoveObject && MoveObject->IsValid())
+	{
+		Command.Move = FVector(
+			ReadJsonNumber(*MoveObject, TEXT("x")),
+			ReadJsonNumber(*MoveObject, TEXT("y")),
+			ReadJsonNumber(*MoveObject, TEXT("z")));
+	}
+
+	const TSharedPtr<FJsonObject>* RotationObject = nullptr;
+	if (JsonObject->TryGetObjectField(TEXT("rotate"), RotationObject) && RotationObject && RotationObject->IsValid())
+	{
+		Command.Rotation = FRotator(
+			ReadJsonNumber(*RotationObject, TEXT("pitch")),
+			ReadJsonNumber(*RotationObject, TEXT("yaw")),
+			ReadJsonNumber(*RotationObject, TEXT("roll")));
+	}
+
+	Command.Scale = ReadJsonNumber(JsonObject, TEXT("scale"));
+	PendingWebControlCommands.Enqueue(Command);
+	return true;
+}
+
+bool AGGGGameModeBase::SaveUploadedExpressLoopMediaFile(const FString& UploadedFileName, const TArray<uint8>& FileBytes, FString& OutSavedFilePath, FString& OutError) const
+{
+	if (FileBytes.Num() == 0)
+	{
+		OutError = TEXT("Selected MP4 upload is empty.");
+		return false;
+	}
+
+	if (!UploadedFileName.EndsWith(TEXT(".mp4"), ESearchCase::IgnoreCase))
+	{
+		OutError = TEXT("Choose an .mp4 file.");
+		return false;
+	}
+
+	const FString UploadDirectory = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("UploadedMedia")));
+	if (!IFileManager::Get().MakeDirectory(*UploadDirectory, true))
+	{
+		OutError = FString::Printf(TEXT("Could not create upload folder: %s"), *UploadDirectory);
+		return false;
+	}
+
+	const FString SavedFileName = SanitizeUploadedFileName(UploadedFileName);
+	OutSavedFilePath = FPaths::ConvertRelativePathToFull(FPaths::Combine(UploadDirectory, SavedFileName));
+	FPaths::NormalizeFilename(OutSavedFilePath);
+
+	if (!FFileHelper::SaveArrayToFile(FileBytes, *OutSavedFilePath))
+	{
+		OutError = FString::Printf(TEXT("Could not save uploaded MP4: %s"), *OutSavedFilePath);
+		return false;
+	}
+
+	UE_LOG(LogTemp, Display, TEXT("Uploaded MP4 saved to %s (%d byte(s))."), *OutSavedFilePath, FileBytes.Num());
+	return true;
+}
+
+void AGGGGameModeBase::UpdateCachedWebControlState()
+{
+	const FString StateJson = BuildWebControlStateJson();
+	FScopeLock Lock(&WebControlStateCriticalSection);
+	CachedWebControlStateJson = StateJson;
+}
+
+FString AGGGGameModeBase::BuildWebControlPage() const
+{
+	FString Page;
+	Page.Reserve(25000);
+	Page += TEXT(R"HTML(<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GGG Camera Control</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #101317;
+  --panel: #171b20;
+  --panel-2: #20262d;
+  --line: #343d46;
+  --text: #f2f5f7;
+  --muted: #9ba8b4;
+  --accent: #2f7dd3;
+  --accent-2: #18a884;
+  --danger: #d9634f;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Segoe UI, Roboto, Arial, sans-serif;
+}
+.app {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(400px, 460px) minmax(0, 1fr);
+  gap: 14px;
+  padding: 14px;
+  overflow-x: hidden;
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  min-width: 0;
+}
+h1, h2 {
+  margin: 0 0 12px;
+  font-size: 18px;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; }
+.targets, .row, .grid {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.targets { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid { grid-template-columns: repeat(3, minmax(76px, 1fr)); }
+.file-row { display: grid; grid-template-columns: minmax(0, 1fr) 84px; gap: 8px; }
+.hidden-file { display: none; }
+.spacer { visibility: hidden; }
+button, .toggle, input[type="text"] {
+  min-height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  user-select: none;
+  touch-action: manipulation;
+  min-width: 0;
+}
+input[type="text"] {
+  width: 100%;
+  cursor: text;
+  user-select: text;
+  padding: 0 10px;
+}
+button:hover, .toggle:hover { border-color: #617283; }
+input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+button.pressed { background: var(--accent-2); border-color: var(--accent-2); color: #061512; }
+button.selected { background: var(--accent); border-color: var(--accent); }
+button:disabled { opacity: 0.35; cursor: not-allowed; }
+.toggle {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+}
+.toggle input { width: 18px; height: 18px; }
+.stack { display: grid; gap: 14px; min-width: 0; }
+.status {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+  min-width: 0;
+}
+.value {
+  min-height: 28px;
+  padding: 8px;
+  border-radius: 6px;
+  background: #11161b;
+  border: 1px solid #27313a;
+  color: var(--text);
+  font-family: Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+}
+.danger { background: #2a1714; border-color: #7b3328; color: #ffd7d0; }
+@media (max-width: 1120px) {
+  .app { grid-template-columns: 1fr; }
+}
+@media (max-width: 520px) {
+  .app { padding: 8px; gap: 8px; }
+  .panel { padding: 10px; }
+  .targets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .file-row { grid-template-columns: 1fr; }
+}
+</style>
+)HTML");
+	Page += TEXT(R"HTML(
+</head>
+<body>
+<main class="app">
+  <section class="panel stack">
+    <div>
+      <h1>GGG Control</h1>
+      <div class="targets" id="targets">
+        <button data-target="camera" data-index="0">Cam 1</button>
+        <button data-target="camera" data-index="1">Cam 2</button>
+        <button data-target="camera" data-index="2">Cam 3</button>
+        <button data-target="camera" data-index="3">Cam 4</button>
+        <button data-target="plate">Input</button>
+        <button data-target="mp4">MP4</button>
+      </div>
+      <label class="toggle"><input id="fast" type="checkbox"> Fast</label>
+    </div>
+    <div class="status">
+      <div id="selectedText">Connecting...</div>
+      <div class="value" id="transformText">Waiting for state</div>
+      <div class="value" id="serverText">http://IP:8080/c</div>
+    </div>
+    <div class="stack">
+      <h2>MP4 File</h2>
+      <div class="file-row">
+        <input id="mp4Path" type="text" spellcheck="false" placeholder="C:\path\video.mp4">
+        <button id="setMp4File">Set</button>
+      </div>
+      <input id="mp4FileInput" class="hidden-file" type="file" accept=".mp4,video/mp4">
+      <button id="chooseMp4File">Choose File</button>
+      <div class="value" id="mp4FileText">Waiting for MP4 state</div>
+    </div>
+  </section>
+  <section class="stack">
+    <div class="panel stack">
+      <h2>Move</h2>
+      <div class="grid">
+        <button data-hold='{"move":{"z":1}}'>Up</button>
+        <button data-hold='{"move":{"x":1}}'>Forward</button>
+        <button data-hold='{"move":{"z":-1}}'>Down</button>
+        <button data-hold='{"move":{"y":-1}}'>Left</button>
+        <button data-hold='{"move":{"x":-1}}'>Back</button>
+        <button data-hold='{"move":{"y":1}}'>Right</button>
+      </div>
+    </div>
+    <div class="panel stack">
+      <h2>Rotate</h2>
+      <div class="grid">
+        <button data-hold='{"rotate":{"pitch":-1}}'>Pitch Up</button>
+        <button id="aimReset">Aim Center</button>
+        <button data-hold='{"rotate":{"pitch":1}}'>Pitch Down</button>
+        <button data-hold='{"rotate":{"yaw":-1}}'>Yaw Left</button>
+        <button data-hold='{"rotate":{"yaw":1}}'>Yaw Right</button>
+        <button class="spacer" disabled></button>
+        <button data-plate-only data-hold='{"rotate":{"roll":-1}}'>Roll Left</button>
+        <button data-plate-only data-hold='{"scale":1}'>Larger</button>
+        <button data-plate-only data-hold='{"rotate":{"roll":1}}'>Roll Right</button>
+        <button class="spacer" disabled></button>
+        <button data-plate-only data-hold='{"scale":-1}'>Smaller</button>
+        <button class="spacer" disabled></button>
+      </div>
+    </div>
+  </section>
+</main>
+)HTML");
+	Page += TEXT(R"HTML(
+<script>
+const pulseMs = 80;
+let selected = { target: "camera", cameraIndex: 0 };
+let lastState = null;
+
+function basePayload() {
+  return {
+    target: selected.target,
+    cameraIndex: selected.cameraIndex,
+    fast: document.getElementById("fast").checked,
+    dt: pulseMs / 1000
+  };
+}
+
+function isPlateLikeTarget() {
+  return selected.target === "plate" || selected.target === "mp4";
+}
+
+async function postControl(command) {
+  const payload = Object.assign(basePayload(), command);
+  try {
+    await fetch("/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+  } catch (error) {
+    document.getElementById("selectedText").textContent = "Control connection lost";
+  }
+}
+
+function selectTarget(target, index) {
+  selected = { target, cameraIndex: index || 0 };
+  updateTargetButtons();
+  postControl({ action: "select", target, cameraIndex: selected.cameraIndex });
+}
+
+function updateTargetButtons() {
+  document.querySelectorAll("#targets button").forEach(button => {
+    const buttonTarget = button.dataset.target;
+    const isCamera = buttonTarget === "camera";
+    const match = isCamera
+      ? selected.target === "camera" && Number(button.dataset.index) === selected.cameraIndex
+      : selected.target === buttonTarget;
+    button.classList.toggle("selected", match);
+  });
+
+  const plateLike = isPlateLikeTarget();
+  document.querySelectorAll("[data-plate-only]").forEach(button => button.disabled = !plateLike);
+  document.getElementById("aimReset").textContent =
+    selected.target === "camera" ? "Aim Center" : (selected.target === "mp4" ? "Reset MP4" : "Reset Input");
+}
+
+function setupHold(button, command) {
+  let timer = null;
+  const start = event => {
+    if (button.disabled || timer) return;
+    event.preventDefault();
+    button.classList.add("pressed");
+    postControl(command);
+    timer = setInterval(() => postControl(command), pulseMs);
+  };
+  const stop = () => {
+    if (!timer) return;
+    clearInterval(timer);
+    timer = null;
+    button.classList.remove("pressed");
+  };
+  button.addEventListener("pointerdown", start);
+  button.addEventListener("pointerup", stop);
+  button.addEventListener("pointerleave", stop);
+  button.addEventListener("pointercancel", stop);
+}
+
+function formatVector(value) {
+  if (!value) return "n/a";
+  return `X ${value.x.toFixed(1)}  Y ${value.y.toFixed(1)}  Z ${value.z.toFixed(1)}`;
+}
+
+function formatRotation(value) {
+  if (!value) return "n/a";
+  return `P ${value.pitch.toFixed(1)}  Y ${value.yaw.toFixed(1)}  R ${value.roll.toFixed(1)}`;
+}
+
+function renderMp4File(mp4) {
+  const input = document.getElementById("mp4Path");
+  const text = document.getElementById("mp4FileText");
+  if (mp4 && mp4.filePath && document.activeElement !== input) {
+    input.value = mp4.filePath;
+  }
+
+  const fileName = mp4 && mp4.fileName ? mp4.fileName : "No MP4 loaded";
+  const status = mp4 && mp4.status ? mp4.status : "Waiting for MP4 player";
+  text.textContent = `${fileName}\n${status}`;
+  text.classList.toggle("danger", Boolean(mp4 && mp4.status && mp4.status.toLowerCase().includes("not found")));
+}
+
+async function uploadMp4File(file) {
+  const text = document.getElementById("mp4FileText");
+  const chooseButton = document.getElementById("chooseMp4File");
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith(".mp4")) {
+    text.textContent = "Choose an .mp4 file";
+    text.classList.add("danger");
+    return;
+  }
+
+  selected = { target: "mp4", cameraIndex: selected.cameraIndex || 0 };
+  updateTargetButtons();
+  chooseButton.disabled = true;
+  text.textContent = `Uploading ${file.name}...`;
+  text.classList.remove("danger");
+
+  try {
+    const response = await fetch(`/uploadmp4?filename=${encodeURIComponent(file.name)}`, {
+      method: "POST",
+      headers: { "Content-Type": "video/mp4" },
+      body: file
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      throw new Error(result.errorMessage || "Upload failed");
+    }
+
+    document.getElementById("mp4Path").value = result.filePath || "";
+    text.textContent = `Uploaded ${result.fileName || file.name}\nLoading on MP4 plate...`;
+    await refreshState();
+  } catch (error) {
+    text.textContent = `Upload failed\n${error.message || error}`;
+    text.classList.add("danger");
+  } finally {
+    chooseButton.disabled = false;
+    document.getElementById("mp4FileInput").value = "";
+  }
+}
+
+)HTML");
+	Page += TEXT(R"HTML(
+function renderState(state) {
+  lastState = state;
+  renderMp4File(state.mp4);
+
+  if (state.selected) {
+    selected.target = state.selected.target;
+    selected.cameraIndex = state.selected.cameraIndex || 0;
+  }
+  updateTargetButtons();
+
+  let source = null;
+  let label = "";
+  if (selected.target === "plate") {
+    source = state.plate;
+    label = "DeckLink input plate";
+  } else if (selected.target === "mp4") {
+    source = state.mp4;
+    label = "MP4 media plate";
+  } else {
+    source = (state.cameras || []).find(camera => camera.index === selected.cameraIndex);
+    label = `Camera ${selected.cameraIndex + 1}`;
+  }
+
+  document.getElementById("selectedText").textContent = `Selected: ${label}`;
+  if (!source || source.available === false) {
+    document.getElementById("transformText").textContent = "Target is not ready yet";
+    document.getElementById("transformText").classList.add("danger");
+    return;
+  }
+
+  document.getElementById("transformText").classList.remove("danger");
+  document.getElementById("transformText").textContent =
+    `Location  ${formatVector(source.location)}\nRotation  ${formatRotation(source.rotation)}\nScale     ${source.scale !== undefined ? source.scale.toFixed(2) : "n/a"}`;
+}
+
+async function refreshState() {
+  try {
+    const response = await fetch("/state", { cache: "no-store" });
+    renderState(await response.json());
+  } catch (error) {
+    document.getElementById("selectedText").textContent = "Waiting for Unreal";
+  }
+}
+
+document.querySelectorAll("#targets button").forEach(button => {
+  button.addEventListener("click", () => selectTarget(button.dataset.target, Number(button.dataset.index || 0)));
+});
+document.querySelectorAll("[data-hold]").forEach(button => setupHold(button, JSON.parse(button.dataset.hold)));
+document.getElementById("aimReset").addEventListener("click", () => {
+  postControl(isPlateLikeTarget() ? { action: "reset" } : { action: "lookAt" });
+});
+document.getElementById("setMp4File").addEventListener("click", () => {
+  const path = document.getElementById("mp4Path").value.trim();
+  if (!path) return;
+  selected = { target: "mp4", cameraIndex: selected.cameraIndex || 0 };
+  updateTargetButtons();
+  postControl({ action: "setFile", target: "mp4", filePath: path });
+});
+document.getElementById("mp4Path").addEventListener("keydown", event => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    document.getElementById("setMp4File").click();
+  }
+});
+document.getElementById("chooseMp4File").addEventListener("click", () => {
+  document.getElementById("mp4FileInput").click();
+});
+document.getElementById("mp4FileInput").addEventListener("change", event => {
+  uploadMp4File(event.target.files && event.target.files[0]);
+});
+document.getElementById("serverText").textContent = `${window.location.protocol}//${window.location.host}/c`;
+
+updateTargetButtons();
+refreshState();
+setInterval(refreshState, 500);
+</script>
+</body>
+</html>)HTML");
+	return Page;
+}
+
+FString AGGGGameModeBase::BuildWebControlStateJson() const
+{
+	FString CameraJson;
+	for (int32 Index = 0; Index < 4; ++Index)
+	{
+		if (!CameraJson.IsEmpty())
+		{
+			CameraJson += TEXT(",");
+		}
+
+		const ACameraActor* Camera = ControlledCameras.IsValidIndex(Index) ? ControlledCameras[Index].Get() : nullptr;
+		if (!Camera)
+		{
+			CameraJson += FString::Printf(TEXT("{\"index\":%d,\"number\":%d,\"available\":false}"), Index, Index + 1);
+			continue;
+		}
+
+		CameraJson += FString::Printf(
+			TEXT("{\"index\":%d,\"number\":%d,\"available\":true,\"location\":%s,\"rotation\":%s,\"scale\":1.0}"),
+			Index,
+			Index + 1,
+			*BuildVectorJson(Camera->GetActorLocation()),
+			*BuildRotatorJson(Camera->GetActorRotation()));
+	}
+
+	FString PlateJson = TEXT("\"available\":false");
+	if (DeckLinkInputScreenActor && DeckLinkInputScreenMeshComponent)
+	{
+		PlateJson = FString::Printf(
+			TEXT("\"available\":true,\"location\":%s,\"rotation\":%s,\"scale\":%.3f"),
+			*BuildVectorJson(DeckLinkInputScreenActor->GetActorLocation()),
+			*BuildRotatorJson(DeckLinkInputScreenMeshComponent->GetComponentRotation()),
+			DeckLinkInputPlateScaleFactor);
+	}
+
+	const FString Mp4FilePathJson = BuildJsonString(ExpressLoopMediaFilePath);
+	const FString Mp4FileNameJson = BuildJsonString(FPaths::GetCleanFilename(ExpressLoopMediaFilePath));
+	const FString Mp4StatusJson = BuildJsonString(ExpressLoopMediaStatus);
+	FString Mp4Json = FString::Printf(
+		TEXT("\"available\":false,\"filePath\":%s,\"fileName\":%s,\"status\":%s"),
+		*Mp4FilePathJson,
+		*Mp4FileNameJson,
+		*Mp4StatusJson);
+	if (ExpressLoopMediaPlateActor && ExpressLoopMediaPlateMeshComponent)
+	{
+		Mp4Json = FString::Printf(
+			TEXT("\"available\":true,\"location\":%s,\"rotation\":%s,\"scale\":%.3f,\"filePath\":%s,\"fileName\":%s,\"status\":%s"),
+			*BuildVectorJson(ExpressLoopMediaPlateActor->GetActorLocation()),
+			*BuildRotatorJson(ExpressLoopMediaPlateMeshComponent->GetComponentRotation()),
+			ExpressLoopMediaPlateScaleFactor,
+			*Mp4FilePathJson,
+			*Mp4FileNameJson,
+			*Mp4StatusJson);
+	}
+
+	const TCHAR* SelectedTargetString = TEXT("camera");
+	if (bControllingDeckLinkInputPlate)
+	{
+		SelectedTargetString = TEXT("plate");
+	}
+	else if (bControllingExpressLoopMediaPlate)
+	{
+		SelectedTargetString = TEXT("mp4");
+	}
+
+	return FString::Printf(
+		TEXT("{\"webPort\":%u,\"selected\":{\"target\":\"%s\",\"cameraIndex\":%d,\"cameraNumber\":%d},\"cameras\":[%s],\"plate\":{%s},\"mp4\":{%s}}"),
+		WebControlPort,
+		SelectedTargetString,
+		SelectedCameraIndex,
+		SelectedCameraIndex + 1,
+		*CameraJson,
+		*PlateJson,
+		*Mp4Json);
 }
 
 void AGGGPreviewHUD::DrawHUD()
@@ -548,6 +2130,8 @@ void AGGGGameModeBase::SetupDeckLinkInputScreen()
 	DeckLinkInputScreenActor->AddInstanceComponent(DisplayRootComponent);
 	DisplayRootComponent->SetMobility(EComponentMobility::Movable);
 	DisplayRootComponent->RegisterComponent();
+	DeckLinkInputScreenActor->SetActorLocation(DeckLinkInputPlateDefaultLocation);
+	DeckLinkInputScreenActor->SetActorRotation(FRotator::ZeroRotator);
 
 	DeckLinkInputMediaSoundComponent = NewObject<UMediaSoundComponent>(DeckLinkInputScreenActor, TEXT("DeckLinkInputDevice5Audio"));
 	if (DeckLinkInputMediaSoundComponent)
@@ -576,6 +2160,7 @@ void AGGGGameModeBase::SetupDeckLinkInputScreen()
 	}
 
 	AddDeckLinkInputScreenMesh(DeckLinkInputScreenActor, DeckLinkInputMediaTexture);
+	ResetDeckLinkInputPlate();
 
 	if (!DeckLinkInputMediaPlayer->OpenSource(DeckLinkInputMediaSource))
 	{
@@ -588,6 +2173,63 @@ void AGGGGameModeBase::SetupDeckLinkInputScreen()
 	World->GetTimerManager().SetTimer(DeckLinkInputAudioKickTimerHandle, this, &AGGGGameModeBase::KickDeckLinkInputAudio, 0.25f, true);
 
 	UE_LOG(LogTemp, Display, TEXT("DeckLink input device %d is placed in the scene as a visible video screen with stereo audio routed into Unreal."), DeckLinkInputDeviceId);
+}
+
+void AGGGGameModeBase::SetupExpressLoopMediaPlate()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	if (!DeckLinkInputDisplayMesh || !DeckLinkInputScreenMaterial)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Express loop media plate skipped: engine display mesh or video material is unavailable."));
+		return;
+	}
+
+	const FString FullMediaPath = ResolveExpressLoopMediaFilePath(ExpressLoopMediaRelativePath);
+	if (!FPaths::FileExists(FullMediaPath))
+	{
+		ExpressLoopMediaStatus = FString::Printf(TEXT("Express loop media plate skipped: file not found at %s."), *FullMediaPath);
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *ExpressLoopMediaStatus);
+		return;
+	}
+
+	ExpressLoopMediaSource = NewObject<UFileMediaSource>(this, TEXT("ExpressLoopMediaSource"));
+	ExpressLoopMediaSource->PrecacheFile = false;
+
+	ExpressLoopMediaPlayer = NewObject<UMediaPlayer>(this, TEXT("ExpressLoopMediaPlayer"));
+	ExpressLoopMediaPlayer->PlayOnOpen = true;
+	ExpressLoopMediaPlayer->SetLooping(true);
+	ExpressLoopMediaPlayer->OnEndReached.AddUniqueDynamic(this, &AGGGGameModeBase::HandleExpressLoopMediaEndReached);
+
+	ExpressLoopMediaTexture = NewObject<UMediaTexture>(this, TEXT("ExpressLoopMediaTexture"));
+	ExpressLoopMediaTexture->SetMediaPlayer(ExpressLoopMediaPlayer);
+	ExpressLoopMediaTexture->UpdateResource();
+
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Name = TEXT("ExpressLoopMediaPlate");
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	ExpressLoopMediaPlateActor = World->SpawnActor<AActor>(AActor::StaticClass(), ExpressLoopMediaPlateLocation, FRotator::ZeroRotator, SpawnParameters);
+	if (!ExpressLoopMediaPlateActor)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Express loop media plate skipped: could not spawn the plate actor."));
+		return;
+	}
+
+	USceneComponent* PlateRootComponent = NewObject<USceneComponent>(ExpressLoopMediaPlateActor, TEXT("ExpressLoopMediaPlateRoot"));
+	ExpressLoopMediaPlateActor->SetRootComponent(PlateRootComponent);
+	ExpressLoopMediaPlateActor->AddInstanceComponent(PlateRootComponent);
+	PlateRootComponent->SetMobility(EComponentMobility::Movable);
+	PlateRootComponent->RegisterComponent();
+	ExpressLoopMediaPlateActor->SetActorLocation(ExpressLoopMediaPlateLocation);
+	ExpressLoopMediaPlateActor->SetActorRotation(FRotator::ZeroRotator);
+
+	AddExpressLoopMediaPlateMesh(ExpressLoopMediaPlateActor, ExpressLoopMediaTexture);
+	ResetExpressLoopMediaPlate();
+	OpenExpressLoopMediaFile(FullMediaPath, false);
 }
 
 void AGGGGameModeBase::KickDeckLinkInputAudio()
@@ -649,6 +2291,30 @@ void AGGGGameModeBase::KickDeckLinkInputAudio()
 	}
 }
 
+void AGGGGameModeBase::AddExpressLoopMediaPlateMesh(AActor* PlateActor, UMediaTexture* MediaTexture)
+{
+	if (!PlateActor || !PlateActor->GetRootComponent() || !MediaTexture || !DeckLinkInputDisplayMesh || !DeckLinkInputScreenMaterial)
+	{
+		return;
+	}
+
+	ExpressLoopMediaPlateMeshComponent = NewObject<UStaticMeshComponent>(PlateActor, TEXT("ExpressLoopMediaPlateMesh"));
+	ExpressLoopMediaPlateMeshComponent->SetupAttachment(PlateActor->GetRootComponent());
+	ExpressLoopMediaPlateMeshComponent->SetStaticMesh(DeckLinkInputDisplayMesh);
+	ExpressLoopMediaPlateMeshComponent->SetRelativeRotation(ExpressLoopMediaPlateRotation);
+	ExpressLoopMediaPlateMeshComponent->SetRelativeScale3D(ExpressLoopMediaPlateScale);
+	ExpressLoopMediaPlateMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	ExpressLoopMediaPlateMeshComponent->SetGenerateOverlapEvents(false);
+	ExpressLoopMediaPlateMeshComponent->SetCastShadow(false);
+	ExpressLoopMediaPlateMeshComponent->bReceivesDecals = false;
+
+	PlateActor->AddInstanceComponent(ExpressLoopMediaPlateMeshComponent);
+	ExpressLoopMediaPlateMeshComponent->RegisterComponent();
+
+	UMaterialInstanceDynamic* DynamicMaterial = ExpressLoopMediaPlateMeshComponent->CreateAndSetMaterialInstanceDynamicFromMaterial(0, DeckLinkInputScreenMaterial);
+	ApplyMediaTextureToMaterial(DynamicMaterial, MediaTexture);
+}
+
 void AGGGGameModeBase::AddDeckLinkInputScreenMesh(AActor* ScreenActor, UMediaTexture* MediaTexture)
 {
 	if (!ScreenActor || !ScreenActor->GetRootComponent() || !MediaTexture || !DeckLinkInputDisplayMesh || !DeckLinkInputScreenMaterial)
@@ -670,12 +2336,7 @@ void AGGGGameModeBase::AddDeckLinkInputScreenMesh(AActor* ScreenActor, UMediaTex
 	DeckLinkInputScreenMeshComponent->RegisterComponent();
 
 	UMaterialInstanceDynamic* DynamicMaterial = DeckLinkInputScreenMeshComponent->CreateAndSetMaterialInstanceDynamicFromMaterial(0, DeckLinkInputScreenMaterial);
-	if (DynamicMaterial)
-	{
-		DynamicMaterial->SetTextureParameterValue(TEXT("SlateUI"), MediaTexture);
-		DynamicMaterial->SetVectorParameterValue(TEXT("TintColorAndOpacity"), FLinearColor::White);
-		DynamicMaterial->SetScalarParameterValue(TEXT("OpacityFromTexture"), 1.0f);
-	}
+	ApplyMediaTextureToMaterial(DynamicMaterial, MediaTexture);
 }
 
 void AGGGGameModeBase::SyncDeckLinkCaptures()

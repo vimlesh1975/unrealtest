@@ -18,6 +18,14 @@
 		{
 			"Name": "BlackmagicMedia",
 			"Enabled": true
+		},
+		{
+			"Name": "MediaCompositing",
+			"Enabled": true
+		},
+		{
+			"Name": "MediaPlate",
+			"Enabled": true
 		}
 	],
 	"TargetPlatforms": [

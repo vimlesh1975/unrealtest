@@ -17,7 +17,9 @@ public class GGGProject : ModuleRules
 			"BlackmagicMediaOutput",
 			"TimeManagement",
 			"MediaAssets",
-			"AudioMixer"
+			"AudioMixer",
+			"HTTPServer",
+			"Json"
 		});
 	}
 }
