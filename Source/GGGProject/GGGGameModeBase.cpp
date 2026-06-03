@@ -525,6 +525,12 @@ void AGGGGameModeBase::ArrangeStudioCameras(const TArray<AActor*>& OrderedCamera
 			CameraComponent->SetFieldOfView(62.0f);
 			CameraComponent->SetAspectRatio(16.0f / 9.0f);
 			CameraComponent->bConstrainAspectRatio = false;
+			CameraComponent->PostProcessSettings.bOverride_AutoExposureMethod = true;
+			CameraComponent->PostProcessSettings.AutoExposureMethod = AEM_Manual;
+			CameraComponent->PostProcessSettings.bOverride_AutoExposureBias = true;
+			CameraComponent->PostProcessSettings.AutoExposureBias = 0.0f;
+			CameraComponent->PostProcessSettings.bOverride_AutoExposureApplyPhysicalCameraExposure = true;
+			CameraComponent->PostProcessSettings.AutoExposureApplyPhysicalCameraExposure = false;
 		}
 	}
 
@@ -2854,13 +2860,15 @@ void AGGGGameModeBase::AddExpressLoopMediaPlateMesh(AActor* PlateActor, UMediaTe
 	ExpressLoopMediaPlateMeshComponent->SetStaticMesh(DeckLinkInputDisplayMesh);
 	ExpressLoopMediaPlateMeshComponent->SetRelativeRotation(ExpressLoopMediaPlateRotation);
 	ExpressLoopMediaPlateMeshComponent->SetRelativeScale3D(ExpressLoopMediaPlateScale);
-	ExpressLoopMediaPlateMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	ExpressLoopMediaPlateMeshComponent->SetGenerateOverlapEvents(false);
-	ExpressLoopMediaPlateMeshComponent->SetCastShadow(false);
-	ExpressLoopMediaPlateMeshComponent->bReceivesDecals = false;
+		ExpressLoopMediaPlateMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		ExpressLoopMediaPlateMeshComponent->SetGenerateOverlapEvents(false);
+		ExpressLoopMediaPlateMeshComponent->SetCastShadow(false);
+		ExpressLoopMediaPlateMeshComponent->bReceivesDecals = false;
+		ExpressLoopMediaPlateMeshComponent->SetAffectDistanceFieldLighting(false);
+		ExpressLoopMediaPlateMeshComponent->SetAffectDynamicIndirectLighting(false);
 
-	PlateActor->AddInstanceComponent(ExpressLoopMediaPlateMeshComponent);
-	ExpressLoopMediaPlateMeshComponent->RegisterComponent();
+		PlateActor->AddInstanceComponent(ExpressLoopMediaPlateMeshComponent);
+		ExpressLoopMediaPlateMeshComponent->RegisterComponent();
 
 	ExpressLoopMediaPlateMaterial = ExpressLoopMediaPlateMeshComponent->CreateAndSetMaterialInstanceDynamicFromMaterial(0, DeckLinkInputScreenMaterial);
 	ApplyMediaTextureToMaterial(ExpressLoopMediaPlateMaterial, MediaTexture);
@@ -2882,6 +2890,8 @@ void AGGGGameModeBase::AddDeckLinkInputScreenMesh(AActor* ScreenActor, UMediaTex
 	DeckLinkInputScreenMeshComponent->SetGenerateOverlapEvents(false);
 	DeckLinkInputScreenMeshComponent->SetCastShadow(false);
 	DeckLinkInputScreenMeshComponent->bReceivesDecals = false;
+	DeckLinkInputScreenMeshComponent->SetAffectDistanceFieldLighting(false);
+	DeckLinkInputScreenMeshComponent->SetAffectDynamicIndirectLighting(false);
 
 	ScreenActor->AddInstanceComponent(DeckLinkInputScreenMeshComponent);
 	DeckLinkInputScreenMeshComponent->RegisterComponent();
@@ -3001,6 +3011,13 @@ void AGGGGameModeBase::SetupDeckLinkOutputs(const TArray<AActor*>& OrderedCamera
 		SceneCapture->bCaptureOnMovement = true;
 		SceneCapture->bAlwaysPersistRenderingState = true;
 		SceneCapture->FOVAngle = CameraActor->GetCameraComponent() ? CameraActor->GetCameraComponent()->FieldOfView : 90.0f;
+		SceneCapture->PostProcessBlendWeight = 1.0f;
+		SceneCapture->PostProcessSettings.bOverride_AutoExposureMethod = true;
+		SceneCapture->PostProcessSettings.AutoExposureMethod = AEM_Manual;
+		SceneCapture->PostProcessSettings.bOverride_AutoExposureBias = true;
+		SceneCapture->PostProcessSettings.AutoExposureBias = 0.0f;
+		SceneCapture->PostProcessSettings.bOverride_AutoExposureApplyPhysicalCameraExposure = true;
+		SceneCapture->PostProcessSettings.AutoExposureApplyPhysicalCameraExposure = false;
 		DeckLinkSceneCaptures[Index] = SceneCapture;
 		SyncDeckLinkCapture(Index, false);
 
