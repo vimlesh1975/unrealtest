@@ -331,8 +331,13 @@ AGGGGameModeBase::AGGGGameModeBase()
 		DeckLinkInputScreenMaterial = ScreenMaterialFinder.Object;
 	}
 
-	static ConstructorHelpers::FObjectFinder<UMaterialInterface> ChromaKeyMaterialFinder(TEXT("/Engine/EngineMaterials/Widget3DPassThrough_Masked.Widget3DPassThrough_Masked"));
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> ChromaKeyMaterialFinder(TEXT("/Engine/EngineMaterials/Widget3DPassThrough_Masked_OneSided.Widget3DPassThrough_Masked_OneSided"));
 	ChromaKeyScreenMaterial = ChromaKeyMaterialFinder.Object;
+	if (!ChromaKeyScreenMaterial)
+	{
+		static ConstructorHelpers::FObjectFinder<UMaterialInterface> ChromaKeyFallbackMaterialFinder(TEXT("/Engine/EngineMaterials/Widget3DPassThrough_Masked.Widget3DPassThrough_Masked"));
+		ChromaKeyScreenMaterial = ChromaKeyFallbackMaterialFinder.Object;
+	}
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> RoomMeshFinder(TEXT("/Engine/BasicShapes/Cube.Cube"));
 	StudioRoomMesh = RoomMeshFinder.Object;
@@ -3462,6 +3467,7 @@ void AGGGGameModeBase::AddChromaKeyPlateMesh(AActor* PlateActor, UTexture2D* Pla
 	ChromaKeyPlateMeshComponent->SetStaticMesh(DeckLinkInputDisplayMesh);
 	ChromaKeyPlateMeshComponent->SetRelativeRotation(ChromaKeyPlateDefaultRotation);
 	ChromaKeyPlateMeshComponent->SetRelativeScale3D(ChromaKeyPlateDefaultScale);
+	ChromaKeyPlateMeshComponent->SetReverseCulling(true);
 	ChromaKeyPlateMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	ChromaKeyPlateMeshComponent->SetGenerateOverlapEvents(false);
 	ChromaKeyPlateMeshComponent->SetCastShadow(false);
@@ -3475,6 +3481,21 @@ void AGGGGameModeBase::AddChromaKeyPlateMesh(AActor* PlateActor, UTexture2D* Pla
 	UMaterialInterface* MaterialBase = ChromaKeyScreenMaterial ? ChromaKeyScreenMaterial.Get() : DeckLinkInputScreenMaterial.Get();
 	ChromaKeyPlateMaterial = ChromaKeyPlateMeshComponent->CreateAndSetMaterialInstanceDynamicFromMaterial(0, MaterialBase);
 	ApplyChromaKeyTextureToMaterial(ChromaKeyPlateMaterial, PlateTexture);
+
+	ChromaKeyPlateBackMeshComponent = NewObject<UStaticMeshComponent>(PlateActor, TEXT("ChromaKeyPlateBackMesh"));
+	ChromaKeyPlateBackMeshComponent->SetupAttachment(ChromaKeyPlateMeshComponent);
+	ChromaKeyPlateBackMeshComponent->SetStaticMesh(DeckLinkInputDisplayMesh);
+	ChromaKeyPlateBackMeshComponent->SetRelativeTransform(FTransform::Identity);
+	ChromaKeyPlateBackMeshComponent->SetReverseCulling(false);
+	ChromaKeyPlateBackMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	ChromaKeyPlateBackMeshComponent->SetGenerateOverlapEvents(false);
+	ChromaKeyPlateBackMeshComponent->SetCastShadow(false);
+	ChromaKeyPlateBackMeshComponent->bReceivesDecals = false;
+	ChromaKeyPlateBackMeshComponent->SetAffectDistanceFieldLighting(false);
+	ChromaKeyPlateBackMeshComponent->SetAffectDynamicIndirectLighting(false);
+	PlateActor->AddInstanceComponent(ChromaKeyPlateBackMeshComponent);
+	ChromaKeyPlateBackMeshComponent->RegisterComponent();
+	ChromaKeyPlateBackMeshComponent->SetMaterial(0, ChromaKeyPlateMaterial);
 }
 
 void AGGGGameModeBase::AddExpressLoopMediaPlateMesh(AActor* PlateActor, UMediaTexture* MediaTexture)
