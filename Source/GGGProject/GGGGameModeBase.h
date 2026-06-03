@@ -223,9 +223,6 @@ private:
 	TObjectPtr<UStaticMeshComponent> ChromaKeyPlateMeshComponent;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UStaticMeshComponent> ChromaKeyPlateBackMeshComponent;
-
-	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> ChromaKeyPlateMaterial;
 
 	TArray<FColor> ChromaKeySourcePixels;

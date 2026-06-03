@@ -4,6 +4,8 @@ import unreal
 ASSET_DIR = "/Game/Materials"
 ASSET_NAME = "M_LiveChromaKey"
 ASSET_PATH = f"{ASSET_DIR}/{ASSET_NAME}"
+DEFAULT_MEDIA_TEXTURE_NAME = "T_DefaultChromaKeyMedia"
+DEFAULT_MEDIA_TEXTURE_PATH = f"{ASSET_DIR}/{DEFAULT_MEDIA_TEXTURE_NAME}"
 
 
 def make_scalar(material, name, default_value, x, y):
@@ -20,6 +22,21 @@ def make_scalar(material, name, default_value, x, y):
 
 def main():
     unreal.EditorAssetLibrary.make_directory(ASSET_DIR)
+
+    default_media_texture = unreal.EditorAssetLibrary.load_asset(DEFAULT_MEDIA_TEXTURE_PATH)
+    if not default_media_texture:
+        media_texture_factory_class = getattr(unreal, "MediaTextureFactoryNew", None)
+        default_media_texture = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+            DEFAULT_MEDIA_TEXTURE_NAME,
+            ASSET_DIR,
+            unreal.MediaTexture,
+            media_texture_factory_class() if media_texture_factory_class else None,
+        )
+    if default_media_texture:
+        default_media_texture.set_editor_property("new_style_output", False)
+        default_media_texture.set_editor_property("enable_gen_mips", False)
+        default_media_texture.update_resource()
+        unreal.EditorAssetLibrary.save_loaded_asset(default_media_texture)
 
     material = unreal.EditorAssetLibrary.load_asset(ASSET_PATH)
     if not material:
@@ -47,7 +64,9 @@ def main():
         -160,
     )
     texture.set_editor_property("parameter_name", "MediaTexture")
-    texture.set_editor_property("sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_COLOR)
+    if default_media_texture:
+        texture.set_editor_property("texture", default_media_texture)
+    texture.set_editor_property("sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_EXTERNAL)
 
     key_enabled = make_scalar(material, "KeyEnabled", 0.0, -700, 40)
     tolerance = make_scalar(material, "Tolerance", 0.12, -700, 180)
@@ -116,7 +135,7 @@ def main():
         unreal.MaterialEditingLibrary.connect_material_expressions(despill, "", custom, "Despill"),
         unreal.MaterialEditingLibrary.connect_material_expressions(custom, "", rgb_mask, ""),
         unreal.MaterialEditingLibrary.connect_material_expressions(custom, "", alpha_mask, ""),
-        unreal.MaterialEditingLibrary.connect_material_property(rgb_mask, "", unreal.MaterialProperty.MP_BASE_COLOR),
+        unreal.MaterialEditingLibrary.connect_material_property(rgb_mask, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR),
         unreal.MaterialEditingLibrary.connect_material_property(alpha_mask, "", unreal.MaterialProperty.MP_OPACITY),
     ]
 

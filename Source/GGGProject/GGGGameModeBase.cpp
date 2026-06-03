@@ -131,9 +131,9 @@ const FVector DeckLinkInputPlateDefaultScale(-4.2f, 2.3625f, 1.0f);
 constexpr float DeckLinkInputPlateMinScale = 0.2f;
 constexpr float DeckLinkInputPlateMaxScale = 5.0f;
 const TCHAR* ChromaKeyPlateRelativePath = TEXT("media/mixkit-female-reporter-reporting-with-microphone-in-hand-on-a-chroma-28293-full-hd_i.mp4");
-const FVector ChromaKeyPlateDefaultLocation(0.0f, 607.0f, 255.0f);
+const FVector ChromaKeyPlateDefaultLocation(0.0f, 320.0f, 255.0f);
 const FRotator ChromaKeyPlateDefaultRotation(0.0f, 0.0f, 90.0f);
-const FVector ChromaKeyPlateDefaultScale(-4.0f, 2.66f, 1.0f);
+const FVector ChromaKeyPlateDefaultScale(-5.6f, 1.575f, 1.0f);
 constexpr float ChromaKeyPlateMinScale = 0.2f;
 constexpr float ChromaKeyPlateMaxScale = 5.0f;
 constexpr bool bDefaultChromaKeyEnabled = false;
@@ -485,7 +485,7 @@ void AGGGGameModeBase::SetupStudioRoom()
 	}
 
 	AddStudioRoomSurface(TEXT("StudioBottomFloor"), FVector(0.0f, -250.0f, -12.0f), FVector(18.0f, 20.0f, 0.08f), FLinearColor(0.22f, 0.25f, 0.31f, 1.0f));
-	AddStudioRoomSurface(TEXT("StudioFrontScreenWall"), FVector(0.0f, 710.0f, 315.0f), FVector(18.0f, 0.08f, 6.6f), FLinearColor(0.36f, 0.13f, 0.16f, 1.0f));
+	AddStudioRoomSurface(TEXT("StudioFrontScreenWall"), FVector(0.0f, 710.0f, 315.0f), FVector(18.0f, 0.08f, 6.6f), FLinearColor(0.85f, 0.03f, 0.02f, 1.0f));
 	AddStudioRoomSurface(TEXT("StudioCameraSideWall"), FVector(0.0f, -1250.0f, 315.0f), FVector(18.0f, 0.08f, 6.6f), FLinearColor(0.35f, 0.29f, 0.12f, 1.0f));
 	AddStudioRoomSurface(TEXT("StudioLeftWall"), FVector(-900.0f, -250.0f, 315.0f), FVector(0.08f, 20.0f, 6.6f), FLinearColor(0.11f, 0.24f, 0.43f, 1.0f));
 	AddStudioRoomSurface(TEXT("StudioRightWall"), FVector(900.0f, -250.0f, 315.0f), FVector(0.08f, 20.0f, 6.6f), FLinearColor(0.13f, 0.34f, 0.22f, 1.0f));
@@ -3440,7 +3440,6 @@ void AGGGGameModeBase::SetupChromaKeyPlate()
 
 	ChromaKeyMediaTexture = NewObject<UMediaTexture>(this, TEXT("ChromaKeyVideoTexture"));
 	ChromaKeyMediaTexture->SetMediaPlayer(ChromaKeyMediaPlayer);
-	ChromaKeyMediaTexture->NewStyleOutput = true;
 	ChromaKeyMediaTexture->UpdateResource();
 
 	FActorSpawnParameters SpawnParameters;
@@ -3476,9 +3475,15 @@ void AGGGGameModeBase::SetupChromaKeyPlate()
 		ChromaKeyLastRestartWorldTimeSeconds = World->GetTimeSeconds() - ChromaKeyMediaRestartCooldownSeconds;
 		ChromaKeyLastPlaybackCommandWorldTimeSeconds = World->GetTimeSeconds();
 		ChromaKeyMediaRestartCounter = 0;
+		ApplyChromaKeyTextureToMaterial(ChromaKeyPlateMaterial, ChromaKeyMediaTexture);
+		ApplyChromaKeySettingsToMaterial(ChromaKeyPlateMaterial, bChromaKeyEnabled, ChromaKeyTolerance, ChromaKeySoftness, ChromaKeyDespill);
+		if (ChromaKeyPlateMeshComponent)
+		{
+			ChromaKeyPlateMeshComponent->MarkRenderStateDirty();
+		}
 	}
 
-	UE_LOG(LogTemp, Display, TEXT("Chroma key plate loaded %s as a looping reporter video between the DeckLink input and MP4 plates; open=%s player=%s material=%s."),
+	UE_LOG(LogTemp, Display, TEXT("Chroma key plate loaded %s as a looping reporter video in front of the DeckLink input and MP4 plates; open=%s player=%s material=%s."),
 		*ChromaKeyMediaPath,
 		bOpened ? TEXT("yes") : TEXT("no"),
 		*ChromaKeyMediaPlayer->GetDesiredPlayerName().ToString(),
@@ -3639,21 +3644,6 @@ void AGGGGameModeBase::AddChromaKeyPlateMesh(AActor* PlateActor, UTexture* Plate
 	ChromaKeyPlateMaterial = ChromaKeyPlateMeshComponent->CreateAndSetMaterialInstanceDynamicFromMaterial(0, MaterialBase);
 	ApplyChromaKeyTextureToMaterial(ChromaKeyPlateMaterial, PlateTexture);
 	ApplyChromaKeySettingsToMaterial(ChromaKeyPlateMaterial, bChromaKeyEnabled, ChromaKeyTolerance, ChromaKeySoftness, ChromaKeyDespill);
-
-	ChromaKeyPlateBackMeshComponent = NewObject<UStaticMeshComponent>(PlateActor, TEXT("ChromaKeyPlateBackMesh"));
-	ChromaKeyPlateBackMeshComponent->SetupAttachment(ChromaKeyPlateMeshComponent);
-	ChromaKeyPlateBackMeshComponent->SetStaticMesh(DeckLinkInputDisplayMesh);
-	ChromaKeyPlateBackMeshComponent->SetRelativeTransform(FTransform::Identity);
-	ChromaKeyPlateBackMeshComponent->SetReverseCulling(false);
-	ChromaKeyPlateBackMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	ChromaKeyPlateBackMeshComponent->SetGenerateOverlapEvents(false);
-	ChromaKeyPlateBackMeshComponent->SetCastShadow(false);
-	ChromaKeyPlateBackMeshComponent->bReceivesDecals = false;
-	ChromaKeyPlateBackMeshComponent->SetAffectDistanceFieldLighting(false);
-	ChromaKeyPlateBackMeshComponent->SetAffectDynamicIndirectLighting(false);
-	PlateActor->AddInstanceComponent(ChromaKeyPlateBackMeshComponent);
-	ChromaKeyPlateBackMeshComponent->RegisterComponent();
-	ChromaKeyPlateBackMeshComponent->SetMaterial(0, ChromaKeyPlateMaterial);
 }
 
 void AGGGGameModeBase::AddExpressLoopMediaPlateMesh(AActor* PlateActor, UMediaTexture* MediaTexture)
