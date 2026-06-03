@@ -311,6 +311,19 @@ void ApplyChromaKeyTextureToMaterial(UMaterialInstanceDynamic* DynamicMaterial, 
 	DynamicMaterial->SetTextureParameterValue(TEXT("Texture"), PlateTexture);
 	DynamicMaterial->SetScalarParameterValue(TEXT("Opacity"), 1.0f);
 }
+
+void ApplyChromaKeySettingsToMaterial(UMaterialInstanceDynamic* DynamicMaterial, bool bEnabled, float Tolerance, float Softness, float Despill)
+{
+	if (!DynamicMaterial)
+	{
+		return;
+	}
+
+	DynamicMaterial->SetScalarParameterValue(TEXT("KeyEnabled"), bEnabled ? 1.0f : 0.0f);
+	DynamicMaterial->SetScalarParameterValue(TEXT("Tolerance"), FMath::Clamp(Tolerance, 0.0f, 1.0f));
+	DynamicMaterial->SetScalarParameterValue(TEXT("Softness"), FMath::Clamp(Softness, 0.001f, 1.0f));
+	DynamicMaterial->SetScalarParameterValue(TEXT("Despill"), FMath::Clamp(Despill, 0.0f, 1.0f));
+}
 }
 
 AGGGGameModeBase::AGGGGameModeBase()
@@ -335,8 +348,13 @@ AGGGGameModeBase::AGGGGameModeBase()
 		DeckLinkInputScreenMaterial = ScreenMaterialFinder.Object;
 	}
 
-	static ConstructorHelpers::FObjectFinder<UMaterialInterface> ChromaKeyMaterialFinder(TEXT("/Engine/EngineMaterials/Widget3DPassThrough_Masked_OneSided.Widget3DPassThrough_Masked_OneSided"));
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> ChromaKeyMaterialFinder(TEXT("/Game/Materials/M_LiveChromaKey.M_LiveChromaKey"));
 	ChromaKeyScreenMaterial = ChromaKeyMaterialFinder.Object;
+	if (!ChromaKeyScreenMaterial)
+	{
+		static ConstructorHelpers::FObjectFinder<UMaterialInterface> ChromaKeyFallbackMaterialFinder(TEXT("/Engine/EngineMaterials/Widget3DPassThrough_Masked_OneSided.Widget3DPassThrough_Masked_OneSided"));
+		ChromaKeyScreenMaterial = ChromaKeyFallbackMaterialFinder.Object;
+	}
 	if (!ChromaKeyScreenMaterial)
 	{
 		static ConstructorHelpers::FObjectFinder<UMaterialInterface> ChromaKeyFallbackMaterialFinder(TEXT("/Engine/EngineMaterials/Widget3DPassThrough_Masked.Widget3DPassThrough_Masked"));
@@ -1312,6 +1330,7 @@ void AGGGGameModeBase::RebuildChromaKeyTexture()
 	if (ChromaKeyPlateMaterial)
 	{
 		ApplyChromaKeyTextureToMaterial(ChromaKeyPlateMaterial, ChromaKeyPlateTexture);
+		ApplyChromaKeySettingsToMaterial(ChromaKeyPlateMaterial, bChromaKeyEnabled, ChromaKeyTolerance, ChromaKeySoftness, ChromaKeyDespill);
 	}
 }
 
@@ -1335,6 +1354,7 @@ void AGGGGameModeBase::ApplyChromaKeySettings(const FGGGWebControlCommand& Comma
 	}
 
 	RebuildChromaKeyTexture();
+	ApplyChromaKeySettingsToMaterial(ChromaKeyPlateMaterial, bChromaKeyEnabled, ChromaKeyTolerance, ChromaKeySoftness, ChromaKeyDespill);
 	if (GEngine && bShowStatus)
 	{
 		GEngine->AddOnScreenDebugMessage(
@@ -3420,6 +3440,7 @@ void AGGGGameModeBase::SetupChromaKeyPlate()
 
 	ChromaKeyMediaTexture = NewObject<UMediaTexture>(this, TEXT("ChromaKeyVideoTexture"));
 	ChromaKeyMediaTexture->SetMediaPlayer(ChromaKeyMediaPlayer);
+	ChromaKeyMediaTexture->NewStyleOutput = true;
 	ChromaKeyMediaTexture->UpdateResource();
 
 	FActorSpawnParameters SpawnParameters;
@@ -3617,6 +3638,7 @@ void AGGGGameModeBase::AddChromaKeyPlateMesh(AActor* PlateActor, UTexture* Plate
 	UMaterialInterface* MaterialBase = ChromaKeyScreenMaterial ? ChromaKeyScreenMaterial.Get() : DeckLinkInputScreenMaterial.Get();
 	ChromaKeyPlateMaterial = ChromaKeyPlateMeshComponent->CreateAndSetMaterialInstanceDynamicFromMaterial(0, MaterialBase);
 	ApplyChromaKeyTextureToMaterial(ChromaKeyPlateMaterial, PlateTexture);
+	ApplyChromaKeySettingsToMaterial(ChromaKeyPlateMaterial, bChromaKeyEnabled, ChromaKeyTolerance, ChromaKeySoftness, ChromaKeyDespill);
 
 	ChromaKeyPlateBackMeshComponent = NewObject<UStaticMeshComponent>(PlateActor, TEXT("ChromaKeyPlateBackMesh"));
 	ChromaKeyPlateBackMeshComponent->SetupAttachment(ChromaKeyPlateMeshComponent);
