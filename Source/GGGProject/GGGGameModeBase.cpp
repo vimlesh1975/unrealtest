@@ -130,7 +130,7 @@ const FRotator DeckLinkInputPlateDefaultRotation(0.0f, 0.0f, 90.0f);
 const FVector DeckLinkInputPlateDefaultScale(-4.2f, 2.3625f, 1.0f);
 constexpr float DeckLinkInputPlateMinScale = 0.2f;
 constexpr float DeckLinkInputPlateMaxScale = 5.0f;
-const TCHAR* ChromaKeyPlateRelativePath = TEXT("media/green_screen_studio.jpg");
+const TCHAR* ChromaKeyPlateRelativePath = TEXT("media/mixkit-female-reporter-reporting-with-microphone-in-hand-on-a-chroma-28293-full-hd_i.mp4");
 const FVector ChromaKeyPlateDefaultLocation(0.0f, 607.0f, 255.0f);
 const FRotator ChromaKeyPlateDefaultRotation(0.0f, 0.0f, 90.0f);
 const FVector ChromaKeyPlateDefaultScale(-4.0f, 2.66f, 1.0f);
@@ -140,6 +140,10 @@ constexpr bool bDefaultChromaKeyEnabled = false;
 constexpr float DefaultChromaKeyTolerance = 0.12f;
 constexpr float DefaultChromaKeySoftness = 0.22f;
 constexpr float DefaultChromaKeyDespill = 0.75f;
+const FName ChromaKeyMediaPlayerName(TEXT("ElectraPlayer"));
+constexpr double ChromaKeyMediaStallSeconds = 1.25;
+constexpr double ChromaKeyMediaRestartCooldownSeconds = 1.75;
+constexpr double ChromaKeyMediaCommandCooldownSeconds = 2.0;
 const TCHAR* ExpressLoopMediaRelativePath = TEXT("media/go1080p25.mp4");
 const FName ExpressLoopMediaPlayerName(TEXT("WmfMedia"));
 const FVector ExpressLoopMediaPlateLocation(430.0f, 610.0f, 255.0f);
@@ -692,6 +696,7 @@ void AGGGGameModeBase::Tick(float DeltaSeconds)
 	{
 		KeepExpressLoopMediaLooping();
 	}
+	KeepChromaKeyMediaLooping();
 	SyncDeckLinkCaptures();
 	UpdateCachedWebControlState();
 }
@@ -1342,6 +1347,114 @@ void AGGGGameModeBase::ApplyChromaKeySettings(const FGGGWebControlCommand& Comma
 				ChromaKeySoftness,
 				ChromaKeyDespill));
 	}
+}
+
+void AGGGGameModeBase::KeepChromaKeyMediaLooping()
+{
+	if (!ChromaKeyMediaPlayer || !ChromaKeyMediaSource || ChromaKeyMediaFilePath.IsEmpty())
+	{
+		return;
+	}
+
+	const double NowSeconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	const FTimespan Duration = ChromaKeyMediaPlayer->GetDuration();
+	const FTimespan CurrentTime = ChromaKeyMediaPlayer->GetTime();
+	const bool bHasPlayableDuration = Duration > FTimespan::FromSeconds(1.0);
+	const bool bTimeChanged = !bChromaKeyMediaTimeInitialized || CurrentTime != ChromaKeyLastMediaTime;
+	if (bTimeChanged)
+	{
+		bChromaKeyMediaTimeInitialized = true;
+		ChromaKeyLastMediaTime = CurrentTime;
+		ChromaKeyLastAdvanceWorldTimeSeconds = NowSeconds;
+	}
+
+	if (bHasPlayableDuration && CurrentTime >= Duration - FTimespan::FromMilliseconds(250.0))
+	{
+		if (NowSeconds - ChromaKeyLastPlaybackCommandWorldTimeSeconds < ChromaKeyMediaCommandCooldownSeconds)
+		{
+			return;
+		}
+
+		ChromaKeyLastPlaybackCommandWorldTimeSeconds = NowSeconds;
+		ChromaKeyMediaPlayer->Seek(FTimespan::Zero());
+		ChromaKeyMediaPlayer->Play();
+		ChromaKeyMediaPlayer->SetRate(1.0f);
+		bChromaKeyMediaTimeInitialized = false;
+		ChromaKeyLastAdvanceWorldTimeSeconds = NowSeconds;
+		return;
+	}
+
+	if (!ChromaKeyMediaPlayer->IsPlaying())
+	{
+		if (NowSeconds - ChromaKeyLastPlaybackCommandWorldTimeSeconds < ChromaKeyMediaCommandCooldownSeconds)
+		{
+			return;
+		}
+
+		if (bHasPlayableDuration && CurrentTime >= Duration - FTimespan::FromMilliseconds(500.0))
+		{
+			ChromaKeyMediaPlayer->Seek(FTimespan::Zero());
+		}
+		ChromaKeyLastPlaybackCommandWorldTimeSeconds = NowSeconds;
+		ChromaKeyMediaPlayer->Play();
+		ChromaKeyMediaPlayer->SetRate(1.0f);
+		if (!ChromaKeyMediaPlayer->IsPlaying())
+		{
+			RestartChromaKeyMediaPlayback(TEXT("player stopped"));
+		}
+		return;
+	}
+
+	const bool bInMiddleOfClip = bHasPlayableDuration
+		&& CurrentTime > FTimespan::FromMilliseconds(250.0)
+		&& CurrentTime < Duration - FTimespan::FromMilliseconds(500.0);
+	if (bInMiddleOfClip
+		&& bChromaKeyMediaTimeInitialized
+		&& NowSeconds - ChromaKeyLastAdvanceWorldTimeSeconds > ChromaKeyMediaStallSeconds)
+	{
+		RestartChromaKeyMediaPlayback(TEXT("media time stalled"));
+	}
+}
+
+void AGGGGameModeBase::RestartChromaKeyMediaPlayback(const TCHAR* Reason)
+{
+	if (!ChromaKeyMediaPlayer || !ChromaKeyMediaSource || ChromaKeyMediaFilePath.IsEmpty())
+	{
+		return;
+	}
+
+	const double NowSeconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	if (NowSeconds - ChromaKeyLastRestartWorldTimeSeconds < ChromaKeyMediaRestartCooldownSeconds)
+	{
+		return;
+	}
+
+	ChromaKeyLastRestartWorldTimeSeconds = NowSeconds;
+	ChromaKeyLastPlaybackCommandWorldTimeSeconds = NowSeconds;
+	++ChromaKeyMediaRestartCounter;
+	bChromaKeyMediaTimeInitialized = false;
+	ChromaKeyLastMediaTime = FTimespan::Zero();
+	ChromaKeyLastAdvanceWorldTimeSeconds = NowSeconds;
+
+	ChromaKeyMediaPlayer->Close();
+	ChromaKeyMediaSource->SetFilePath(ChromaKeyMediaFilePath);
+	ChromaKeyMediaSource->PrecacheFile = false;
+	ChromaKeyMediaPlayer->PlayOnOpen = true;
+	ChromaKeyMediaPlayer->SetDesiredPlayerName(ChromaKeyMediaPlayerName);
+	ChromaKeyMediaPlayer->SetLooping(false);
+
+	const bool bOpened = ChromaKeyMediaPlayer->OpenSource(ChromaKeyMediaSource);
+	if (bOpened)
+	{
+		ChromaKeyMediaPlayer->Play();
+		ChromaKeyMediaPlayer->SetRate(1.0f);
+	}
+
+	UE_LOG(LogTemp, Display, TEXT("Chroma key reporter video restart %d (%s): open=%s player=%s."),
+		ChromaKeyMediaRestartCounter,
+		Reason ? Reason : TEXT("watchdog"),
+		bOpened ? TEXT("yes") : TEXT("no"),
+		*ChromaKeyMediaPlayer->GetDesiredPlayerName().ToString());
 }
 
 bool AGGGGameModeBase::OpenExpressLoopMediaFile(const FString& FilePath, bool bShowStatus)
@@ -3289,18 +3402,25 @@ void AGGGGameModeBase::SetupChromaKeyPlate()
 		return;
 	}
 
-	const FString ChromaKeyImagePath = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectContentDir(), ChromaKeyPlateRelativePath));
-	if (!FPaths::FileExists(ChromaKeyImagePath))
+	const FString ChromaKeyMediaPath = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectContentDir(), ChromaKeyPlateRelativePath));
+	if (!FPaths::FileExists(ChromaKeyMediaPath))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("Chroma key plate skipped: image not found at %s."), *ChromaKeyImagePath);
+		UE_LOG(LogTemp, Warning, TEXT("Chroma key plate skipped: media file not found at %s."), *ChromaKeyMediaPath);
 		return;
 	}
 
-	if (!LoadChromaKeySourceImage(ChromaKeyImagePath) || !ChromaKeyPlateTexture)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("Chroma key plate skipped: could not load %s."), *ChromaKeyImagePath);
-		return;
-	}
+	ChromaKeyMediaSource = NewObject<UFileMediaSource>(this, TEXT("ChromaKeyVideoSource"));
+	ChromaKeyMediaSource->SetFilePath(ChromaKeyMediaPath);
+	ChromaKeyMediaSource->PrecacheFile = false;
+
+	ChromaKeyMediaPlayer = NewObject<UMediaPlayer>(this, TEXT("ChromaKeyVideoPlayer"));
+	ChromaKeyMediaPlayer->PlayOnOpen = true;
+	ChromaKeyMediaPlayer->SetDesiredPlayerName(ChromaKeyMediaPlayerName);
+	ChromaKeyMediaPlayer->SetLooping(false);
+
+	ChromaKeyMediaTexture = NewObject<UMediaTexture>(this, TEXT("ChromaKeyVideoTexture"));
+	ChromaKeyMediaTexture->SetMediaPlayer(ChromaKeyMediaPlayer);
+	ChromaKeyMediaTexture->UpdateResource();
 
 	FActorSpawnParameters SpawnParameters;
 	SpawnParameters.Name = TEXT("ChromaKeyPlate");
@@ -3320,11 +3440,27 @@ void AGGGGameModeBase::SetupChromaKeyPlate()
 	ChromaKeyPlateActor->SetActorLocation(ChromaKeyPlateDefaultLocation);
 	ChromaKeyPlateActor->SetActorRotation(FRotator::ZeroRotator);
 
-	AddChromaKeyPlateMesh(ChromaKeyPlateActor, ChromaKeyPlateTexture);
+	AddChromaKeyPlateMesh(ChromaKeyPlateActor, ChromaKeyMediaTexture);
 	ResetChromaKeyPlate();
 
-	UE_LOG(LogTemp, Display, TEXT("Chroma key plate loaded %s and placed between the DeckLink input and MP4 plates using %s."),
-		*ChromaKeyImagePath,
+	const bool bOpened = ChromaKeyMediaPlayer->OpenSource(ChromaKeyMediaSource);
+	if (bOpened)
+	{
+		ChromaKeyMediaPlayer->Play();
+		ChromaKeyMediaPlayer->SetRate(1.0f);
+		ChromaKeyMediaFilePath = ChromaKeyMediaPath;
+		bChromaKeyMediaTimeInitialized = false;
+		ChromaKeyLastMediaTime = FTimespan::Zero();
+		ChromaKeyLastAdvanceWorldTimeSeconds = World->GetTimeSeconds();
+		ChromaKeyLastRestartWorldTimeSeconds = World->GetTimeSeconds() - ChromaKeyMediaRestartCooldownSeconds;
+		ChromaKeyLastPlaybackCommandWorldTimeSeconds = World->GetTimeSeconds();
+		ChromaKeyMediaRestartCounter = 0;
+	}
+
+	UE_LOG(LogTemp, Display, TEXT("Chroma key plate loaded %s as a looping reporter video between the DeckLink input and MP4 plates; open=%s player=%s material=%s."),
+		*ChromaKeyMediaPath,
+		bOpened ? TEXT("yes") : TEXT("no"),
+		*ChromaKeyMediaPlayer->GetDesiredPlayerName().ToString(),
 		ChromaKeyScreenMaterial ? TEXT("runtime alpha key material") : TEXT("fallback media material"));
 }
 
@@ -3455,7 +3591,7 @@ void AGGGGameModeBase::KickDeckLinkInputAudio()
 	}
 }
 
-void AGGGGameModeBase::AddChromaKeyPlateMesh(AActor* PlateActor, UTexture2D* PlateTexture)
+void AGGGGameModeBase::AddChromaKeyPlateMesh(AActor* PlateActor, UTexture* PlateTexture)
 {
 	if (!PlateActor || !PlateActor->GetRootComponent() || !PlateTexture || !DeckLinkInputDisplayMesh || !DeckLinkInputScreenMaterial)
 	{

@@ -29,7 +29,7 @@
 		},
 		{
 			"Name": "ElectraPlayer",
-			"Enabled": false
+			"Enabled": true
 		},
 		{
 			"Name": "WmfMedia",

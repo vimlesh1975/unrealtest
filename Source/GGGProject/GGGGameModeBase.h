@@ -26,6 +26,7 @@ class UMediaTexture;
 class USceneCaptureComponent2D;
 class UStaticMesh;
 class UStaticMeshComponent;
+class UTexture;
 class UTexture2D;
 class UTextureRenderTarget2D;
 class IHttpRouter;
@@ -99,7 +100,7 @@ private:
 	void KickDeckLinkInputAudio();
 	void SetupDeckLinkOutputs(const TArray<AActor*>& OrderedCameras);
 	void AddDeckLinkInputScreenMesh(AActor* ScreenActor, UMediaTexture* MediaTexture);
-	void AddChromaKeyPlateMesh(AActor* PlateActor, UTexture2D* PlateTexture);
+	void AddChromaKeyPlateMesh(AActor* PlateActor, UTexture* PlateTexture);
 	void AddExpressLoopMediaPlateMesh(AActor* PlateActor, UMediaTexture* MediaTexture);
 	void HandleCameraControl(float DeltaSeconds);
 	void HandleDeckLinkInputPlateControl(APlayerController* PlayerController, float DeltaSeconds);
@@ -122,6 +123,8 @@ private:
 	bool LoadChromaKeySourceImage(const FString& ImagePath);
 	void RebuildChromaKeyTexture();
 	void ApplyChromaKeySettings(const FGGGWebControlCommand& Command, bool bShowStatus);
+	void KeepChromaKeyMediaLooping();
+	void RestartChromaKeyMediaPlayback(const TCHAR* Reason);
 	void ConfigureExpressLoopMediaPlayer(UMediaPlayer* MediaPlayer, bool bPlayOnOpen) const;
 	void ConfigureExpressLoopMediaSource(UFileMediaSource* MediaSource, const FString& FilePath) const;
 	void RefreshExpressLoopMediaPlayerDelegates();
@@ -205,6 +208,15 @@ private:
 	TObjectPtr<UTexture2D> ChromaKeyPlateTexture;
 
 	UPROPERTY(Transient)
+	TObjectPtr<UFileMediaSource> ChromaKeyMediaSource;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMediaPlayer> ChromaKeyMediaPlayer;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMediaTexture> ChromaKeyMediaTexture;
+
+	UPROPERTY(Transient)
 	TObjectPtr<AActor> ChromaKeyPlateActor;
 
 	UPROPERTY(Transient)
@@ -223,6 +235,13 @@ private:
 	float ChromaKeyTolerance = 0.12f;
 	float ChromaKeySoftness = 0.22f;
 	float ChromaKeyDespill = 0.75f;
+	FString ChromaKeyMediaFilePath;
+	FTimespan ChromaKeyLastMediaTime = FTimespan::Zero();
+	double ChromaKeyLastAdvanceWorldTimeSeconds = 0.0;
+	double ChromaKeyLastRestartWorldTimeSeconds = -1000.0;
+	double ChromaKeyLastPlaybackCommandWorldTimeSeconds = -1000.0;
+	int32 ChromaKeyMediaRestartCounter = 0;
+	bool bChromaKeyMediaTimeInitialized = false;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UFileMediaSource> ExpressLoopMediaSource;
