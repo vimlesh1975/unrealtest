@@ -26,6 +26,14 @@
 		{
 			"Name": "MediaPlate",
 			"Enabled": true
+		},
+		{
+			"Name": "ElectraPlayer",
+			"Enabled": false
+		},
+		{
+			"Name": "WmfMedia",
+			"Enabled": true
 		}
 	],
 	"TargetPlatforms": [

@@ -19,7 +19,8 @@ public class GGGProject : ModuleRules
 			"MediaAssets",
 			"AudioMixer",
 			"HTTPServer",
-			"Json"
+			"Json",
+			"ImageWrapper"
 		});
 	}
 }

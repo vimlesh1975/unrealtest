@@ -257,24 +257,28 @@ namespace BlackmagicMediaPlayerHelpers
 
 				if (InFrameInfo.AudioBuffer)
 				{
-					static FThreadSafeCounter InputAudioDebugLogCount;
 					const int32* AudioBuffer = reinterpret_cast<int32*>(InFrameInfo.AudioBuffer);
 					const int32 AudioValueCount = InFrameInfo.AudioBufferSize / sizeof(int32);
-					int64 AbsSum = 0;
-					int64 Peak = 0;
-					for (int32 AudioIndex = 0; AudioIndex < AudioValueCount; ++AudioIndex)
-					{
-						const int64 Value = AudioBuffer[AudioIndex];
-						const int64 AbsValue = Value < 0 ? -Value : Value;
-						AbsSum += AbsValue;
-						Peak = FMath::Max(Peak, AbsValue);
-					}
 
-					const int32 DebugIndex = InputAudioDebugLogCount.Increment();
-					if (DebugIndex <= 40 || (DebugIndex <= 1000 && DebugIndex % 100 == 0))
+					if (MediaPlayer->bVerifyFrameDropCount)
 					{
-						UE_LOG(LogBlackmagicMedia, Display, TEXT("DeckLink input audio debug: device %d received %d int32 values, %d channel(s), %d Hz, %d byte(s), abs sum %lld, peak %lld."),
-							ChannelInfo.DeviceIndex, AudioValueCount, InFrameInfo.NumberOfAudioChannel, InFrameInfo.AudioRate, InFrameInfo.AudioBufferSize, AbsSum, Peak);
+						static FThreadSafeCounter InputAudioDebugLogCount;
+						int64 AbsSum = 0;
+						int64 Peak = 0;
+						for (int32 AudioIndex = 0; AudioIndex < AudioValueCount; ++AudioIndex)
+						{
+							const int64 Value = AudioBuffer[AudioIndex];
+							const int64 AbsValue = Value < 0 ? -Value : Value;
+							AbsSum += AbsValue;
+							Peak = FMath::Max(Peak, AbsValue);
+						}
+
+						const int32 DebugIndex = InputAudioDebugLogCount.Increment();
+						if (DebugIndex <= 40 || (DebugIndex <= 1000 && DebugIndex % 100 == 0))
+						{
+							UE_LOG(LogBlackmagicMedia, Display, TEXT("DeckLink input audio debug: device %d received %d int32 values, %d channel(s), %d Hz, %d byte(s), abs sum %lld, peak %lld."),
+								ChannelInfo.DeviceIndex, AudioValueCount, InFrameInfo.NumberOfAudioChannel, InFrameInfo.AudioRate, InFrameInfo.AudioBufferSize, AbsSum, Peak);
+						}
 					}
 
 					FBlackmagicMediaAudioBridge::PushInputAudio(ChannelInfo.DeviceIndex, AudioBuffer, AudioValueCount, InFrameInfo.NumberOfAudioChannel, InFrameInfo.AudioRate);

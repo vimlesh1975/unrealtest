@@ -943,6 +943,7 @@ void UBlackmagicMediaCapture::OutputAudio_AnyThread(const FCaptureBaseData& InBa
 			AudioSamples.NumAudioSamples = AudioBuffer.Num() / NumOutputChannels;
 			AudioSamples.AudioBufferLength = AudioBuffer.Num() * sizeof(int32);
 
+			if (bLogDropFrame)
 			{
 				int64 AbsSum = 0;
 				int64 Peak = 0;
@@ -992,6 +993,7 @@ void UBlackmagicMediaCapture::OutputAudio_AnyThread(const FCaptureBaseData& InBa
 			AudioSamples.NumAudioSamples = AudioBuffer.Num() / NumOutputChannels;
 			AudioSamples.AudioBufferLength = AudioBuffer.Num() * sizeof(int16);
 
+			if (bLogDropFrame)
 			{
 				int64 AbsSum = 0;
 				int32 Peak = 0;

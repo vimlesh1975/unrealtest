@@ -1,5 +1,6 @@
 #include "GGGGameModeBase.h"
 
+#include "Async/Async.h"
 #include "BlackmagicMediaOutput.h"
 #include "BlackmagicMediaSource.h"
 #include "BlackmagicDeviceProvider.h"
@@ -17,6 +18,8 @@
 #include "Engine/PointLight.h"
 #include "Engine/SceneCapture2D.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/Texture.h"
+#include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "FileMediaSource.h"
@@ -30,6 +33,7 @@
 #include "HttpServerRequest.h"
 #include "HttpServerResponse.h"
 #include "IHttpRouter.h"
+#include "ImageUtils.h"
 #include "InputCoreTypes.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Kismet/GameplayStatics.h"
@@ -123,14 +127,21 @@ const FRotator DeckLinkInputPlateDefaultRotation(0.0f, 0.0f, 90.0f);
 const FVector DeckLinkInputPlateDefaultScale(-4.2f, 2.3625f, 1.0f);
 constexpr float DeckLinkInputPlateMinScale = 0.2f;
 constexpr float DeckLinkInputPlateMaxScale = 5.0f;
-const TCHAR* ExpressLoopMediaRelativePath = TEXT("media/express_loop.mp4");
+const TCHAR* ExpressLoopMediaRelativePath = TEXT("media/go1080p25.mp4");
+const FName ExpressLoopMediaPlayerName(TEXT("WmfMedia"));
 const FVector ExpressLoopMediaPlateLocation(280.0f, 610.0f, 255.0f);
 const FRotator ExpressLoopMediaPlateRotation(0.0f, 0.0f, 90.0f);
 const FVector ExpressLoopMediaPlateScale(-4.2f, 2.3625f, 1.0f);
 constexpr float ExpressLoopMediaPlateMinScale = 0.2f;
 constexpr float ExpressLoopMediaPlateMaxScale = 5.0f;
 constexpr int64 ExpressLoopMediaPrecacheMaxBytes = 256LL * 1024LL * 1024LL;
-constexpr double ExpressLoopMediaLoopLeadMilliseconds = 80.0;
+constexpr double ExpressLoopMediaLoopLeadMilliseconds = 2000.0;
+constexpr float ExpressLoopMediaWatchdogSeconds = 0.05f;
+constexpr float ExpressLoopMediaSwapWarmupSeconds = 0.35f;
+constexpr float ExpressLoopMediaSwapRetrySeconds = 0.15f;
+constexpr int32 ExpressLoopMediaSwapMaxWarmupAttempts = 30;
+constexpr double ExpressLoopMediaMinWarmFrameSeconds = 0.05;
+constexpr float ExpressLoopFrameAnimationFps = 25.0f;
 
 float ClampControlDeltaSeconds(float DeltaSeconds)
 {
@@ -235,7 +246,7 @@ FString SanitizeUploadedFileName(const FString& UploadedFileName)
 	return SanitizedFileName;
 }
 
-void ApplyMediaTextureToMaterial(UMaterialInstanceDynamic* DynamicMaterial, UMediaTexture* MediaTexture)
+void ApplyMediaTextureToMaterial(UMaterialInstanceDynamic* DynamicMaterial, UTexture* MediaTexture)
 {
 	if (!DynamicMaterial || !MediaTexture)
 	{
@@ -306,6 +317,8 @@ void AGGGGameModeBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(DeckLinkInputAudioKickTimerHandle);
+		World->GetTimerManager().ClearTimer(ExpressLoopMediaWatchdogTimerHandle);
+		World->GetTimerManager().ClearTimer(ExpressLoopMediaSwapTimerHandle);
 	}
 
 	StopWebControlServer();
@@ -609,7 +622,14 @@ void AGGGGameModeBase::Tick(float DeltaSeconds)
 
 	HandleCameraControl(DeltaSeconds);
 	ProcessWebControlCommands();
-	KeepExpressLoopMediaLooping();
+	if (bUsingExpressLoopFrameAnimation)
+	{
+		UpdateExpressLoopFrameAnimation(DeltaSeconds);
+	}
+	else
+	{
+		KeepExpressLoopMediaLooping();
+	}
 	SyncDeckLinkCaptures();
 	UpdateCachedWebControlState();
 }
@@ -989,7 +1009,7 @@ FString AGGGGameModeBase::ResolveExpressLoopMediaFilePath(const FString& FilePat
 
 bool AGGGGameModeBase::OpenExpressLoopMediaFile(const FString& FilePath, bool bShowStatus)
 {
-	if (!ExpressLoopMediaSource || !ExpressLoopMediaPlayer)
+	if (!ExpressLoopMediaSource || !ExpressLoopMediaPlayer || !ExpressLoopStandbyMediaSource || !ExpressLoopStandbyMediaPlayer)
 	{
 		ExpressLoopMediaStatus = TEXT("MP4 player is not ready yet.");
 		UE_LOG(LogTemp, Warning, TEXT("%s"), *ExpressLoopMediaStatus);
@@ -1008,13 +1028,34 @@ bool AGGGGameModeBase::OpenExpressLoopMediaFile(const FString& FilePath, bool bS
 		return false;
 	}
 
-	ExpressLoopMediaSource->SetFilePath(FullMediaPath);
-	ExpressLoopMediaSource->PrecacheFile = ShouldPrecacheExpressLoopMediaFile(FullMediaPath);
+	StopExpressLoopFrameAnimation();
+	bExpressLoopMediaRestarting = false;
+	ExpressLoopMediaSwapWarmupAttempts = 0;
+	ExpressLoopMediaLoopCounter = 0;
+	ExpressLoopKnownDurationSeconds = 0.0;
+	if (UWorld* World = GetWorld())
+	{
+		ExpressLoopLastSwitchWorldTimeSeconds = World->GetTimeSeconds();
+	}
+
+	RefreshExpressLoopMediaPlayerDelegates();
+	ConfigureExpressLoopMediaSource(ExpressLoopMediaSource, FullMediaPath);
+	ConfigureExpressLoopMediaPlayer(ExpressLoopMediaPlayer, true);
 	ExpressLoopMediaPlayer->Close();
-	ExpressLoopMediaPlayer->SetLooping(true);
+	ExpressLoopStandbyMediaPlayer->Close();
+	if (ExpressLoopMediaPlateMaterial && ExpressLoopMediaTexture)
+	{
+		ApplyMediaTextureToMaterial(ExpressLoopMediaPlateMaterial, ExpressLoopMediaTexture);
+	}
+
 	const bool bOpened = ExpressLoopMediaPlayer->OpenSource(ExpressLoopMediaSource);
 	if (!bOpened)
 	{
+		if (TryOpenExpressLoopFrameAnimation(FullMediaPath, bShowStatus))
+		{
+			return true;
+		}
+
 		ExpressLoopMediaStatus = FString::Printf(TEXT("MP4 failed to open: %s"), *FullMediaPath);
 		UE_LOG(LogTemp, Warning, TEXT("%s"), *ExpressLoopMediaStatus);
 		if (GEngine && bShowStatus)
@@ -1024,11 +1065,12 @@ bool AGGGGameModeBase::OpenExpressLoopMediaFile(const FString& FilePath, bool bS
 		return false;
 	}
 
-	ExpressLoopMediaPlayer->SetLooping(true);
 	ExpressLoopMediaPlayer->Play();
+	ExpressLoopMediaPlayer->SetRate(1.0f);
+	StartExpressLoopMediaWatchdog();
 	ExpressLoopMediaFilePath = FullMediaPath;
 	ExpressLoopMediaStatus = FString::Printf(TEXT("Playing %s"), *FullMediaPath);
-	UE_LOG(LogTemp, Display, TEXT("Express loop media plate is playing %s in loop."), *FullMediaPath);
+	UE_LOG(LogTemp, Display, TEXT("Express loop media plate is playing %s in loop using %s."), *FullMediaPath, *ExpressLoopMediaPlayer->GetDesiredPlayerName().ToString());
 	if (GEngine && bShowStatus)
 	{
 		GEngine->AddOnScreenDebugMessage(1002, 3.0f, FColor::Cyan, FString::Printf(TEXT("MP4 loaded: %s"), *FPaths::GetCleanFilename(FullMediaPath)));
@@ -1036,61 +1078,398 @@ bool AGGGGameModeBase::OpenExpressLoopMediaFile(const FString& FilePath, bool bS
 	return true;
 }
 
+void AGGGGameModeBase::ConfigureExpressLoopMediaPlayer(UMediaPlayer* MediaPlayer, bool bPlayOnOpen) const
+{
+	if (!MediaPlayer)
+	{
+		return;
+	}
+
+	MediaPlayer->PlayOnOpen = bPlayOnOpen;
+	MediaPlayer->SetDesiredPlayerName(ExpressLoopMediaPlayerName);
+	MediaPlayer->SetLooping(false);
+}
+
+void AGGGGameModeBase::ConfigureExpressLoopMediaSource(UFileMediaSource* MediaSource, const FString& FilePath) const
+{
+	if (!MediaSource)
+	{
+		return;
+	}
+
+	MediaSource->SetFilePath(FilePath);
+	MediaSource->PrecacheFile = ShouldPrecacheExpressLoopMediaFile(FilePath);
+}
+
+bool AGGGGameModeBase::TryOpenExpressLoopFrameAnimation(const FString& FilePath, bool bShowStatus)
+{
+	if (!ExpressLoopMediaPlateMaterial)
+	{
+		return false;
+	}
+
+	const FString FrameDirectory = FPaths::Combine(FPaths::GetPath(FilePath), FPaths::GetBaseFilename(FilePath) + TEXT("_frames"));
+	if (!FPaths::DirectoryExists(FrameDirectory))
+	{
+		return false;
+	}
+
+	TArray<FString> FrameFileNames;
+	IFileManager::Get().FindFiles(FrameFileNames, *FPaths::Combine(FrameDirectory, TEXT("*.jpg")), true, false);
+	if (FrameFileNames.Num() == 0)
+	{
+		IFileManager::Get().FindFiles(FrameFileNames, *FPaths::Combine(FrameDirectory, TEXT("*.png")), true, false);
+	}
+	FrameFileNames.Sort();
+	if (FrameFileNames.Num() == 0)
+	{
+		return false;
+	}
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(ExpressLoopMediaWatchdogTimerHandle);
+		World->GetTimerManager().ClearTimer(ExpressLoopMediaSwapTimerHandle);
+	}
+
+	if (ExpressLoopMediaPlayer)
+	{
+		ExpressLoopMediaPlayer->Close();
+	}
+	if (ExpressLoopStandbyMediaPlayer)
+	{
+		ExpressLoopStandbyMediaPlayer->Close();
+	}
+
+	ExpressLoopFrameTextures.Reset();
+	ExpressLoopFrameTextures.Reserve(FrameFileNames.Num());
+	for (const FString& FrameFileName : FrameFileNames)
+	{
+		const FString FramePath = FPaths::Combine(FrameDirectory, FrameFileName);
+		UTexture2D* FrameTexture = FImageUtils::ImportFileAsTexture2D(FramePath);
+		if (!FrameTexture)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Express loop frame animation skipped bad frame: %s"), *FramePath);
+			continue;
+		}
+
+		FrameTexture->SRGB = true;
+		FrameTexture->NeverStream = true;
+		ExpressLoopFrameTextures.Add(FrameTexture);
+	}
+
+	if (ExpressLoopFrameTextures.Num() == 0)
+	{
+		return false;
+	}
+
+	bUsingExpressLoopFrameAnimation = true;
+	bExpressLoopMediaRestarting = false;
+	ExpressLoopMediaFilePath = FilePath;
+	ExpressLoopFrameAnimationTimeSeconds = 0.0f;
+	ExpressLoopFrameAnimationFrameIndex = INDEX_NONE;
+	ApplyExpressLoopFrameTexture(0);
+
+	ExpressLoopMediaStatus = FString::Printf(TEXT("Playing frame loop %s (%d frames)"), *FilePath, ExpressLoopFrameTextures.Num());
+	UE_LOG(LogTemp, Display, TEXT("Express loop media plate is using frame animation from %s with %d frames at %.2f fps."),
+		*FrameDirectory,
+		ExpressLoopFrameTextures.Num(),
+		ExpressLoopFrameAnimationFps);
+	if (GEngine && bShowStatus)
+	{
+		GEngine->AddOnScreenDebugMessage(1002, 3.0f, FColor::Cyan, FString::Printf(TEXT("Frame loop loaded: %s"), *FPaths::GetCleanFilename(FilePath)));
+	}
+	return true;
+}
+
+void AGGGGameModeBase::UpdateExpressLoopFrameAnimation(float DeltaSeconds)
+{
+	if (!bUsingExpressLoopFrameAnimation || ExpressLoopFrameTextures.Num() == 0 || ExpressLoopFrameAnimationFps <= 0.0f)
+	{
+		return;
+	}
+
+	const float FrameDurationSeconds = 1.0f / ExpressLoopFrameAnimationFps;
+	const float LoopDurationSeconds = FrameDurationSeconds * static_cast<float>(ExpressLoopFrameTextures.Num());
+	if (LoopDurationSeconds <= 0.0f)
+	{
+		return;
+	}
+
+	ExpressLoopFrameAnimationTimeSeconds = FMath::Fmod(
+		ExpressLoopFrameAnimationTimeSeconds + FMath::Max(0.0f, DeltaSeconds),
+		LoopDurationSeconds);
+
+	const int32 FrameIndex = FMath::Clamp(
+		FMath::FloorToInt(ExpressLoopFrameAnimationTimeSeconds * ExpressLoopFrameAnimationFps),
+		0,
+		ExpressLoopFrameTextures.Num() - 1);
+	ApplyExpressLoopFrameTexture(FrameIndex);
+}
+
+void AGGGGameModeBase::ApplyExpressLoopFrameTexture(int32 FrameIndex)
+{
+	if (!ExpressLoopMediaPlateMaterial || !ExpressLoopFrameTextures.IsValidIndex(FrameIndex) || FrameIndex == ExpressLoopFrameAnimationFrameIndex)
+	{
+		return;
+	}
+
+	ApplyMediaTextureToMaterial(ExpressLoopMediaPlateMaterial, ExpressLoopFrameTextures[FrameIndex]);
+	ExpressLoopFrameAnimationFrameIndex = FrameIndex;
+}
+
+void AGGGGameModeBase::StopExpressLoopFrameAnimation()
+{
+	bUsingExpressLoopFrameAnimation = false;
+	ExpressLoopFrameAnimationTimeSeconds = 0.0f;
+	ExpressLoopFrameAnimationFrameIndex = INDEX_NONE;
+	ExpressLoopFrameTextures.Reset();
+}
+
+void AGGGGameModeBase::RefreshExpressLoopMediaPlayerDelegates()
+{
+	if (ExpressLoopMediaPlayer)
+	{
+		ExpressLoopMediaPlayer->OnEndReached.AddUniqueDynamic(this, &AGGGGameModeBase::HandleExpressLoopMediaEndReached);
+		ExpressLoopMediaPlayer->OnMediaOpened.AddUniqueDynamic(this, &AGGGGameModeBase::HandleExpressLoopMediaOpened);
+	}
+
+	if (ExpressLoopStandbyMediaPlayer)
+	{
+		ExpressLoopStandbyMediaPlayer->OnEndReached.RemoveDynamic(this, &AGGGGameModeBase::HandleExpressLoopMediaEndReached);
+		ExpressLoopStandbyMediaPlayer->OnMediaOpened.RemoveDynamic(this, &AGGGGameModeBase::HandleExpressLoopMediaOpened);
+	}
+}
+
+bool AGGGGameModeBase::PrepareExpressLoopStandbyMediaPlayer(const FString& FilePath)
+{
+	if (!ExpressLoopStandbyMediaSource || !ExpressLoopStandbyMediaPlayer || FilePath.IsEmpty() || !FPaths::FileExists(FilePath))
+	{
+		return false;
+	}
+
+	ConfigureExpressLoopMediaSource(ExpressLoopStandbyMediaSource, FilePath);
+	ConfigureExpressLoopMediaPlayer(ExpressLoopStandbyMediaPlayer, false);
+	ExpressLoopStandbyMediaPlayer->OnEndReached.RemoveDynamic(this, &AGGGGameModeBase::HandleExpressLoopMediaEndReached);
+	ExpressLoopStandbyMediaPlayer->OnMediaOpened.RemoveDynamic(this, &AGGGGameModeBase::HandleExpressLoopMediaOpened);
+	ExpressLoopStandbyMediaPlayer->Close();
+
+	const bool bOpened = ExpressLoopStandbyMediaPlayer->OpenSource(ExpressLoopStandbyMediaSource);
+	if (bOpened)
+	{
+		ExpressLoopStandbyMediaPlayer->Seek(FTimespan::Zero());
+		ExpressLoopStandbyMediaPlayer->Pause();
+	}
+
+	UE_LOG(LogTemp, Display, TEXT("Express loop media plate standby prepare: open=%s file=%s."),
+		bOpened ? TEXT("yes") : TEXT("no"),
+		*FilePath);
+	return bOpened;
+}
+
 void AGGGGameModeBase::HandleExpressLoopMediaEndReached()
 {
-	UE_LOG(LogTemp, Display, TEXT("Express loop media plate end reached; rewinding without reopening."));
-	LoopExpressLoopMediaPlayback(true);
+	if (IsInGameThread())
+	{
+		UE_LOG(LogTemp, Display, TEXT("Express loop media plate end reached; switching media player."));
+		LoopExpressLoopMediaPlayback(true);
+		return;
+	}
+
+	TWeakObjectPtr<AGGGGameModeBase> WeakThis(this);
+	AsyncTask(ENamedThreads::GameThread, [WeakThis]()
+	{
+		if (AGGGGameModeBase* GameMode = WeakThis.Get())
+		{
+			UE_LOG(LogTemp, Display, TEXT("Express loop media plate end reached; switching media player."));
+			GameMode->LoopExpressLoopMediaPlayback(true);
+		}
+	});
 }
 
 void AGGGGameModeBase::HandleExpressLoopMediaOpened(FString OpenedUrl)
+{
+	if (IsInGameThread())
+	{
+		HandleExpressLoopMediaOpenedOnGameThread(OpenedUrl);
+		return;
+	}
+
+	TWeakObjectPtr<AGGGGameModeBase> WeakThis(this);
+	AsyncTask(ENamedThreads::GameThread, [WeakThis, OpenedUrl]()
+	{
+		if (AGGGGameModeBase* GameMode = WeakThis.Get())
+		{
+			GameMode->HandleExpressLoopMediaOpenedOnGameThread(OpenedUrl);
+		}
+	});
+}
+
+void AGGGGameModeBase::HandleExpressLoopMediaOpenedOnGameThread(const FString& OpenedUrl)
 {
 	if (!ExpressLoopMediaPlayer)
 	{
 		return;
 	}
 
-	ExpressLoopMediaPlayer->SetLooping(true);
+	ExpressLoopMediaPlayer->SetLooping(false);
 	const bool bPlaying = ExpressLoopMediaPlayer->Play();
 	ExpressLoopMediaPlayer->SetRate(1.0f);
-	UE_LOG(LogTemp, Display, TEXT("Express loop media plate opened %s; play=%s."),
+	const FTimespan Duration = ExpressLoopMediaPlayer->GetDuration();
+	if (Duration > FTimespan::Zero())
+	{
+		ExpressLoopKnownDurationSeconds = Duration.GetTotalSeconds();
+	}
+	if (UWorld* World = GetWorld())
+	{
+		ExpressLoopLastSwitchWorldTimeSeconds = World->GetTimeSeconds();
+	}
+
+	UE_LOG(LogTemp, Display, TEXT("Express loop media plate opened %s; play=%s duration=%.3fs."),
 		*OpenedUrl,
-		bPlaying ? TEXT("yes") : TEXT("no"));
+		bPlaying ? TEXT("yes") : TEXT("no"),
+		Duration.GetTotalSeconds());
 }
 
 void AGGGGameModeBase::LoopExpressLoopMediaPlayback(bool bFromEndReached)
 {
-	if (!ExpressLoopMediaSource || !ExpressLoopMediaPlayer || ExpressLoopMediaFilePath.IsEmpty() || bExpressLoopMediaRestarting)
+	if (!ExpressLoopMediaSource || !ExpressLoopMediaPlayer || !ExpressLoopStandbyMediaSource || !ExpressLoopStandbyMediaPlayer || !ExpressLoopStandbyMediaTexture || ExpressLoopMediaFilePath.IsEmpty() || bExpressLoopMediaRestarting)
 	{
 		return;
 	}
 
 	bExpressLoopMediaRestarting = true;
-	ExpressLoopMediaPlayer->SetLooping(true);
-
-	bool bSeeked = ExpressLoopMediaPlayer->Seek(FTimespan::Zero());
-	if (!bSeeked)
+	const FString LoopMediaFilePath = ExpressLoopMediaFilePath;
+	const double LoopStartWorldTimeSeconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	if (ExpressLoopKnownDurationSeconds <= 0.0 && ExpressLoopLastSwitchWorldTimeSeconds > 0.0 && LoopStartWorldTimeSeconds > ExpressLoopLastSwitchWorldTimeSeconds)
 	{
-		bSeeked = ExpressLoopMediaPlayer->Rewind();
+		ExpressLoopKnownDurationSeconds = LoopStartWorldTimeSeconds - ExpressLoopLastSwitchWorldTimeSeconds;
 	}
 
-	bool bPlaying = false;
-	if (bSeeked)
+	if (!FPaths::FileExists(LoopMediaFilePath))
 	{
-		bPlaying = ExpressLoopMediaPlayer->Play();
-		ExpressLoopMediaPlayer->SetRate(1.0f);
-		ExpressLoopMediaStatus = FString::Printf(TEXT("Playing %s"), *ExpressLoopMediaFilePath);
+		ExpressLoopMediaStatus = FString::Printf(TEXT("MP4 loop file not found: %s"), *LoopMediaFilePath);
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *ExpressLoopMediaStatus);
+		bExpressLoopMediaRestarting = false;
+		return;
 	}
 
-	UE_LOG(LogTemp, Display, TEXT("Express loop media plate loop%s: seek=%s play=%s."),
-		bFromEndReached ? TEXT(" after end") : TEXT(" from watchdog"),
-		bSeeked ? TEXT("yes") : TEXT("no"),
-		bPlaying ? TEXT("yes") : TEXT("no"));
+	ConfigureExpressLoopMediaSource(ExpressLoopStandbyMediaSource, LoopMediaFilePath);
+	ConfigureExpressLoopMediaPlayer(ExpressLoopStandbyMediaPlayer, true);
+
+	ExpressLoopStandbyMediaPlayer->Close();
+	const bool bOpened = ExpressLoopStandbyMediaPlayer->OpenSource(ExpressLoopStandbyMediaSource);
+	const bool bPlaying = ExpressLoopStandbyMediaPlayer->Play();
+	ExpressLoopStandbyMediaPlayer->SetRate(1.0f);
+
+	if (bOpened)
+	{
+		ExpressLoopMediaSwapWarmupAttempts = 0;
+		UE_LOG(LogTemp, Display, TEXT("Express loop media plate loop%s: warming hidden player open=%s play=%s."),
+			bFromEndReached ? TEXT(" after end") : TEXT(" from watchdog"),
+			bOpened ? TEXT("yes") : TEXT("no"),
+			bPlaying ? TEXT("yes") : TEXT("no"));
+
+		if (UWorld* World = GetWorld())
+		{
+			FTimerDelegate SwapDelegate;
+			SwapDelegate.BindUObject(this, &AGGGGameModeBase::CompleteExpressLoopMediaPlayerSwap, bFromEndReached);
+			World->GetTimerManager().ClearTimer(ExpressLoopMediaSwapTimerHandle);
+			World->GetTimerManager().SetTimer(ExpressLoopMediaSwapTimerHandle, SwapDelegate, ExpressLoopMediaSwapWarmupSeconds, false);
+		}
+		return;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("Express loop media plate loop%s: standby open failed, reopening active player."),
+		bFromEndReached ? TEXT(" after end") : TEXT(" from watchdog"));
 	bExpressLoopMediaRestarting = false;
+	ReopenExpressLoopMediaPlayback(bFromEndReached);
+}
 
-	if (!bSeeked)
+void AGGGGameModeBase::CompleteExpressLoopMediaPlayerSwap(bool bFromEndReached)
+{
+	if (!ExpressLoopMediaPlayer || !ExpressLoopMediaTexture || !ExpressLoopStandbyMediaPlayer || !ExpressLoopStandbyMediaTexture || ExpressLoopMediaFilePath.IsEmpty())
 	{
-		ReopenExpressLoopMediaPlayback(bFromEndReached);
+		bExpressLoopMediaRestarting = false;
+		return;
 	}
+
+	bool bPlaying = ExpressLoopStandbyMediaPlayer->IsPlaying();
+	if (!bPlaying)
+	{
+		bPlaying = ExpressLoopStandbyMediaPlayer->Play();
+		ExpressLoopStandbyMediaPlayer->SetRate(1.0f);
+	}
+
+	const double StandbyTimeSeconds = ExpressLoopStandbyMediaPlayer->GetTime().GetTotalSeconds();
+	if ((!bPlaying || StandbyTimeSeconds < ExpressLoopMediaMinWarmFrameSeconds)
+		&& ExpressLoopMediaSwapWarmupAttempts < ExpressLoopMediaSwapMaxWarmupAttempts)
+	{
+		++ExpressLoopMediaSwapWarmupAttempts;
+		UE_LOG(LogTemp, Display, TEXT("Express loop media plate swap waiting: attempt=%d play=%s time=%.3fs."),
+			ExpressLoopMediaSwapWarmupAttempts,
+			bPlaying ? TEXT("yes") : TEXT("no"),
+			StandbyTimeSeconds);
+
+		if (UWorld* World = GetWorld())
+		{
+			FTimerDelegate SwapDelegate;
+			SwapDelegate.BindUObject(this, &AGGGGameModeBase::CompleteExpressLoopMediaPlayerSwap, bFromEndReached);
+			World->GetTimerManager().SetTimer(ExpressLoopMediaSwapTimerHandle, SwapDelegate, ExpressLoopMediaSwapRetrySeconds, false);
+		}
+		return;
+	}
+
+	if (StandbyTimeSeconds < ExpressLoopMediaMinWarmFrameSeconds)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Express loop media plate hidden player did not advance; reopening visible player instead of switching to blank."));
+		ExpressLoopStandbyMediaPlayer->Close();
+		bExpressLoopMediaRestarting = false;
+		ReopenExpressLoopMediaPlayback(bFromEndReached);
+		return;
+	}
+
+	if (ExpressLoopMediaPlateMaterial)
+	{
+		ApplyMediaTextureToMaterial(ExpressLoopMediaPlateMaterial, ExpressLoopStandbyMediaTexture);
+	}
+
+	TObjectPtr<UFileMediaSource> PreviousActiveSource = ExpressLoopMediaSource;
+	TObjectPtr<UMediaPlayer> PreviousActivePlayer = ExpressLoopMediaPlayer;
+	TObjectPtr<UMediaTexture> PreviousActiveTexture = ExpressLoopMediaTexture;
+
+	ExpressLoopMediaSource = ExpressLoopStandbyMediaSource;
+	ExpressLoopMediaPlayer = ExpressLoopStandbyMediaPlayer;
+	ExpressLoopMediaTexture = ExpressLoopStandbyMediaTexture;
+
+	ExpressLoopStandbyMediaSource = PreviousActiveSource;
+	ExpressLoopStandbyMediaPlayer = PreviousActivePlayer;
+	ExpressLoopStandbyMediaTexture = PreviousActiveTexture;
+	RefreshExpressLoopMediaPlayerDelegates();
+
+	++ExpressLoopMediaLoopCounter;
+	const FTimespan NewActiveDuration = ExpressLoopMediaPlayer->GetDuration();
+	if (NewActiveDuration > FTimespan::Zero())
+	{
+		ExpressLoopKnownDurationSeconds = NewActiveDuration.GetTotalSeconds();
+	}
+	if (UWorld* World = GetWorld())
+	{
+		ExpressLoopLastSwitchWorldTimeSeconds = World->GetTimeSeconds();
+	}
+
+	const FString LoopMediaFilePath = ExpressLoopMediaFilePath;
+	ExpressLoopMediaStatus = FString::Printf(TEXT("Playing %s"), *LoopMediaFilePath);
+	UE_LOG(LogTemp, Display, TEXT("Express loop media plate loop %d%s: switched warmed player play=%s time=%.3fs duration=%.3fs."),
+		ExpressLoopMediaLoopCounter,
+		bFromEndReached ? TEXT(" after end") : TEXT(" from watchdog"),
+		bPlaying ? TEXT("yes") : TEXT("no"),
+		StandbyTimeSeconds,
+		ExpressLoopKnownDurationSeconds);
+
+	ConfigureExpressLoopMediaPlayer(ExpressLoopStandbyMediaPlayer, false);
+	ExpressLoopStandbyMediaPlayer->Close();
+	bExpressLoopMediaRestarting = false;
 }
 
 void AGGGGameModeBase::ReopenExpressLoopMediaPlayback(bool bFromEndReached)
@@ -1101,6 +1480,10 @@ void AGGGGameModeBase::ReopenExpressLoopMediaPlayback(bool bFromEndReached)
 	}
 
 	bExpressLoopMediaRestarting = true;
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(ExpressLoopMediaSwapTimerHandle);
+	}
 	const FString LoopMediaFilePath = ExpressLoopMediaFilePath;
 	if (!FPaths::FileExists(LoopMediaFilePath))
 	{
@@ -1110,10 +1493,13 @@ void AGGGGameModeBase::ReopenExpressLoopMediaPlayback(bool bFromEndReached)
 		return;
 	}
 
-	ExpressLoopMediaSource->SetFilePath(LoopMediaFilePath);
-	ExpressLoopMediaSource->PrecacheFile = ShouldPrecacheExpressLoopMediaFile(LoopMediaFilePath);
+	ConfigureExpressLoopMediaSource(ExpressLoopMediaSource, LoopMediaFilePath);
+	ConfigureExpressLoopMediaPlayer(ExpressLoopMediaPlayer, true);
 	ExpressLoopMediaPlayer->Close();
-	ExpressLoopMediaPlayer->SetLooping(true);
+	if (ExpressLoopMediaPlateMaterial && ExpressLoopMediaTexture)
+	{
+		ApplyMediaTextureToMaterial(ExpressLoopMediaPlateMaterial, ExpressLoopMediaTexture);
+	}
 
 	const bool bOpened = ExpressLoopMediaPlayer->OpenSource(ExpressLoopMediaSource);
 	bool bPlaying = false;
@@ -1122,6 +1508,11 @@ void AGGGGameModeBase::ReopenExpressLoopMediaPlayback(bool bFromEndReached)
 		bPlaying = ExpressLoopMediaPlayer->Play();
 		ExpressLoopMediaPlayer->SetRate(1.0f);
 		ExpressLoopMediaStatus = FString::Printf(TEXT("Playing %s"), *LoopMediaFilePath);
+		++ExpressLoopMediaLoopCounter;
+		if (UWorld* World = GetWorld())
+		{
+			ExpressLoopLastSwitchWorldTimeSeconds = World->GetTimeSeconds();
+		}
 	}
 	else
 	{
@@ -1140,6 +1531,12 @@ void AGGGGameModeBase::ReopenExpressLoopMediaPlayback(bool bFromEndReached)
 			bFromEndReached ? TEXT(" after end") : TEXT(" from watchdog"));
 	}
 	bExpressLoopMediaRestarting = false;
+
+	if (bOpened)
+	{
+		ConfigureExpressLoopMediaPlayer(ExpressLoopStandbyMediaPlayer, false);
+		ExpressLoopStandbyMediaPlayer->Close();
+	}
 }
 
 void AGGGGameModeBase::KeepExpressLoopMediaLooping()
@@ -1152,6 +1549,26 @@ void AGGGGameModeBase::KeepExpressLoopMediaLooping()
 	const FTimespan Duration = ExpressLoopMediaPlayer->GetDuration();
 	const FTimespan CurrentTime = ExpressLoopMediaPlayer->GetTime();
 	const FTimespan LoopLeadTime = FTimespan::FromMilliseconds(ExpressLoopMediaLoopLeadMilliseconds);
+	if (Duration > FTimespan::Zero())
+	{
+		ExpressLoopKnownDurationSeconds = Duration.GetTotalSeconds();
+	}
+
+	if (UWorld* World = GetWorld())
+	{
+		const double LeadSeconds = ExpressLoopMediaLoopLeadMilliseconds / 1000.0;
+		const double SwitchAfterSeconds = ExpressLoopKnownDurationSeconds > LeadSeconds + 0.25
+			? ExpressLoopKnownDurationSeconds - LeadSeconds
+			: 0.0;
+		if (SwitchAfterSeconds > 0.0
+			&& ExpressLoopLastSwitchWorldTimeSeconds > 0.0
+			&& World->GetTimeSeconds() - ExpressLoopLastSwitchWorldTimeSeconds >= SwitchAfterSeconds)
+		{
+			LoopExpressLoopMediaPlayback(false);
+			return;
+		}
+	}
+
 	if (Duration > LoopLeadTime && CurrentTime >= Duration - LoopLeadTime)
 	{
 		LoopExpressLoopMediaPlayback(false);
@@ -1174,6 +1591,20 @@ void AGGGGameModeBase::KeepExpressLoopMediaLooping()
 	}
 
 	LoopExpressLoopMediaPlayback(false);
+}
+
+void AGGGGameModeBase::StartExpressLoopMediaWatchdog()
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(ExpressLoopMediaWatchdogTimerHandle);
+		World->GetTimerManager().SetTimer(
+			ExpressLoopMediaWatchdogTimerHandle,
+			this,
+			&AGGGGameModeBase::KeepExpressLoopMediaLooping,
+			ExpressLoopMediaWatchdogSeconds,
+			true);
+	}
 }
 
 void AGGGGameModeBase::ShowCameraControlStatus() const
@@ -2214,8 +2645,8 @@ void AGGGGameModeBase::SetupDeckLinkInputScreen()
 	DeckLinkInputMediaSource->MaxNumAudioFrameBuffer = 32;
 	DeckLinkInputMediaSource->bCaptureVideo = true;
 	DeckLinkInputMediaSource->ColorFormat = EBlackmagicMediaSourceColorFormat::YUV8;
-	DeckLinkInputMediaSource->MaxNumVideoFrameBuffer = 8;
-	DeckLinkInputMediaSource->bLogDropFrame = true;
+	DeckLinkInputMediaSource->MaxNumVideoFrameBuffer = 32;
+	DeckLinkInputMediaSource->bLogDropFrame = false;
 
 	DeckLinkInputMediaPlayer = NewObject<UMediaPlayer>(this, TEXT("DeckLinkInputDevice5Player"));
 	DeckLinkInputMediaPlayer->PlayOnOpen = true;
@@ -2310,14 +2741,24 @@ void AGGGGameModeBase::SetupExpressLoopMediaPlate()
 	ExpressLoopMediaSource->PrecacheFile = false;
 
 	ExpressLoopMediaPlayer = NewObject<UMediaPlayer>(this, TEXT("ExpressLoopMediaPlayer"));
-	ExpressLoopMediaPlayer->PlayOnOpen = true;
-	ExpressLoopMediaPlayer->SetLooping(true);
+	ConfigureExpressLoopMediaPlayer(ExpressLoopMediaPlayer, true);
 	ExpressLoopMediaPlayer->OnEndReached.AddUniqueDynamic(this, &AGGGGameModeBase::HandleExpressLoopMediaEndReached);
 	ExpressLoopMediaPlayer->OnMediaOpened.AddUniqueDynamic(this, &AGGGGameModeBase::HandleExpressLoopMediaOpened);
 
 	ExpressLoopMediaTexture = NewObject<UMediaTexture>(this, TEXT("ExpressLoopMediaTexture"));
 	ExpressLoopMediaTexture->SetMediaPlayer(ExpressLoopMediaPlayer);
 	ExpressLoopMediaTexture->UpdateResource();
+
+	ExpressLoopStandbyMediaSource = NewObject<UFileMediaSource>(this, TEXT("ExpressLoopStandbyMediaSource"));
+	ExpressLoopStandbyMediaSource->PrecacheFile = false;
+
+	ExpressLoopStandbyMediaPlayer = NewObject<UMediaPlayer>(this, TEXT("ExpressLoopStandbyMediaPlayer"));
+	ConfigureExpressLoopMediaPlayer(ExpressLoopStandbyMediaPlayer, false);
+
+	ExpressLoopStandbyMediaTexture = NewObject<UMediaTexture>(this, TEXT("ExpressLoopStandbyMediaTexture"));
+	ExpressLoopStandbyMediaTexture->SetMediaPlayer(ExpressLoopStandbyMediaPlayer);
+	ExpressLoopStandbyMediaTexture->UpdateResource();
+	RefreshExpressLoopMediaPlayerDelegates();
 
 	FActorSpawnParameters SpawnParameters;
 	SpawnParameters.Name = TEXT("ExpressLoopMediaPlate");
@@ -2421,8 +2862,8 @@ void AGGGGameModeBase::AddExpressLoopMediaPlateMesh(AActor* PlateActor, UMediaTe
 	PlateActor->AddInstanceComponent(ExpressLoopMediaPlateMeshComponent);
 	ExpressLoopMediaPlateMeshComponent->RegisterComponent();
 
-	UMaterialInstanceDynamic* DynamicMaterial = ExpressLoopMediaPlateMeshComponent->CreateAndSetMaterialInstanceDynamicFromMaterial(0, DeckLinkInputScreenMaterial);
-	ApplyMediaTextureToMaterial(DynamicMaterial, MediaTexture);
+	ExpressLoopMediaPlateMaterial = ExpressLoopMediaPlateMeshComponent->CreateAndSetMaterialInstanceDynamicFromMaterial(0, DeckLinkInputScreenMaterial);
+	ApplyMediaTextureToMaterial(ExpressLoopMediaPlateMaterial, MediaTexture);
 }
 
 void AGGGGameModeBase::AddDeckLinkInputScreenMesh(AActor* ScreenActor, UMediaTexture* MediaTexture)
@@ -2574,11 +3015,12 @@ void AGGGGameModeBase::SetupDeckLinkOutputs(const TArray<AActor*>& OrderedCamera
 		MediaOutput->PixelFormat = EBlackmagicMediaOutputPixelFormat::PF_10BIT_YUV;
 		MediaOutput->TimecodeFormat = EMediaIOTimecodeFormat::None;
 		MediaOutput->AudioSampleRate = EBlackmagicMediaOutputAudioSampleRate::SR_48k;
+		MediaOutput->AudioBufferSize = 20 * 1024;
 		MediaOutput->OutputChannelCount = EBlackmagicMediaAudioOutputChannelCount::CH_2;
 		MediaOutput->AudioBitDepth = EBlackmagicMediaOutputAudioBitDepth::Signed_16Bits;
 		MediaOutput->bOutputAudio = true;
-		MediaOutput->bLogDropFrame = true;
-		MediaOutput->bUseMultithreadedScheduling = false;
+		MediaOutput->bLogDropFrame = false;
+		MediaOutput->bUseMultithreadedScheduling = true;
 		MediaOutput->bWaitForSyncEvent = false;
 		MediaOutput->NumberOfBlackmagicBuffers = 4;
 		DeckLinkMediaOutputs[Index] = MediaOutput;

@@ -15,6 +15,7 @@ class APlayerController;
 class ASceneCapture2D;
 class UBlackmagicMediaSource;
 class UFileMediaSource;
+class UMaterialInstanceDynamic;
 class UMaterialInterface;
 class UMediaCapture;
 class UBlackmagicMediaOutput;
@@ -25,6 +26,7 @@ class UMediaTexture;
 class USceneCaptureComponent2D;
 class UStaticMesh;
 class UStaticMeshComponent;
+class UTexture2D;
 class UTextureRenderTarget2D;
 class IHttpRouter;
 struct FMediaIOConfiguration;
@@ -104,13 +106,24 @@ private:
 	void ResetExpressLoopMediaPlate();
 	FString ResolveExpressLoopMediaFilePath(const FString& FilePath) const;
 	bool OpenExpressLoopMediaFile(const FString& FilePath, bool bShowStatus);
+	void ConfigureExpressLoopMediaPlayer(UMediaPlayer* MediaPlayer, bool bPlayOnOpen) const;
+	void ConfigureExpressLoopMediaSource(UFileMediaSource* MediaSource, const FString& FilePath) const;
+	void RefreshExpressLoopMediaPlayerDelegates();
+	bool TryOpenExpressLoopFrameAnimation(const FString& FilePath, bool bShowStatus);
+	void UpdateExpressLoopFrameAnimation(float DeltaSeconds);
+	void ApplyExpressLoopFrameTexture(int32 FrameIndex);
+	void StopExpressLoopFrameAnimation();
+	bool PrepareExpressLoopStandbyMediaPlayer(const FString& FilePath);
 	UFUNCTION()
 	void HandleExpressLoopMediaEndReached();
 	UFUNCTION()
 	void HandleExpressLoopMediaOpened(FString OpenedUrl);
+	void HandleExpressLoopMediaOpenedOnGameThread(const FString& OpenedUrl);
 	void LoopExpressLoopMediaPlayback(bool bFromEndReached);
+	void CompleteExpressLoopMediaPlayerSwap(bool bFromEndReached);
 	void ReopenExpressLoopMediaPlayback(bool bFromEndReached);
 	void KeepExpressLoopMediaLooping();
+	void StartExpressLoopMediaWatchdog();
 	void SyncDeckLinkCaptures();
 	void SyncDeckLinkCapture(int32 CameraIndex, bool bCaptureScene);
 	void UpdateSelectedViewportCamera();
@@ -181,10 +194,25 @@ private:
 	TObjectPtr<UMediaTexture> ExpressLoopMediaTexture;
 
 	UPROPERTY(Transient)
+	TObjectPtr<UFileMediaSource> ExpressLoopStandbyMediaSource;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMediaPlayer> ExpressLoopStandbyMediaPlayer;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMediaTexture> ExpressLoopStandbyMediaTexture;
+
+	UPROPERTY(Transient)
 	TObjectPtr<AActor> ExpressLoopMediaPlateActor;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UStaticMeshComponent> ExpressLoopMediaPlateMeshComponent;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> ExpressLoopMediaPlateMaterial;
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UTexture2D>> ExpressLoopFrameTextures;
 
 	FString ExpressLoopMediaFilePath;
 	FString ExpressLoopMediaStatus;
@@ -193,7 +221,16 @@ private:
 	TArray<TObjectPtr<AActor>> StudioRoomActors;
 
 	FTimerHandle DeckLinkInputAudioKickTimerHandle;
+	FTimerHandle ExpressLoopMediaWatchdogTimerHandle;
+	FTimerHandle ExpressLoopMediaSwapTimerHandle;
 	int32 DeckLinkInputAudioKickAttempts = 0;
+	int32 ExpressLoopMediaLoopCounter = 0;
+	int32 ExpressLoopMediaSwapWarmupAttempts = 0;
+	int32 ExpressLoopFrameAnimationFrameIndex = INDEX_NONE;
+	float ExpressLoopFrameAnimationTimeSeconds = 0.0f;
+	double ExpressLoopKnownDurationSeconds = 0.0;
+	double ExpressLoopLastSwitchWorldTimeSeconds = 0.0;
+	bool bUsingExpressLoopFrameAnimation = false;
 
 	TQueue<FGGGWebControlCommand, EQueueMode::Mpsc> PendingWebControlCommands;
 	TSharedPtr<IHttpRouter> WebControlRouter;
