@@ -36,7 +36,8 @@ enum class EGGGWebControlTarget : uint8
 {
 	Camera,
 	DeckLinkInputPlate,
-	ExpressLoopMediaPlate
+	ExpressLoopMediaPlate,
+	ChromaKeyPlate
 };
 
 struct FGGGWebControlCommand
@@ -48,11 +49,17 @@ struct FGGGWebControlCommand
 	float Scale = 0.0f;
 	float DeltaSeconds = 0.08f;
 	FString FilePath;
+	float ChromaKeyTolerance = -1.0f;
+	float ChromaKeySoftness = -1.0f;
+	float ChromaKeyDespill = -1.0f;
 	bool bFast = false;
 	bool bSelectOnly = false;
 	bool bLookAt = false;
 	bool bReset = false;
 	bool bSetFile = false;
+	bool bSetChromaKeySettings = false;
+	bool bHasChromaKeyEnabled = false;
+	bool bChromaKeyEnabled = false;
 };
 
 UCLASS()
@@ -87,25 +94,34 @@ private:
 	void AddStudioRoomLight(const FName& LightName, const FVector& Location, float Intensity, float Radius);
 	void ArrangeStudioCameras(const TArray<AActor*>& OrderedCameras);
 	void SetupDeckLinkInputScreen();
+	void SetupChromaKeyPlate();
 	void SetupExpressLoopMediaPlate();
 	void KickDeckLinkInputAudio();
 	void SetupDeckLinkOutputs(const TArray<AActor*>& OrderedCameras);
 	void AddDeckLinkInputScreenMesh(AActor* ScreenActor, UMediaTexture* MediaTexture);
+	void AddChromaKeyPlateMesh(AActor* PlateActor, UTexture2D* PlateTexture);
 	void AddExpressLoopMediaPlateMesh(AActor* PlateActor, UMediaTexture* MediaTexture);
 	void HandleCameraControl(float DeltaSeconds);
 	void HandleDeckLinkInputPlateControl(APlayerController* PlayerController, float DeltaSeconds);
+	void HandleChromaKeyPlateControl(APlayerController* PlayerController, float DeltaSeconds);
 	void HandleExpressLoopMediaPlateControl(APlayerController* PlayerController, float DeltaSeconds);
 	void SelectCameraControl(int32 CameraIndex, bool bShowStatus);
 	void SelectDeckLinkInputPlateControl(bool bShowStatus);
+	void SelectChromaKeyPlateControl(bool bShowStatus);
 	void SelectExpressLoopMediaPlateControl(bool bShowStatus);
 	void ApplyCameraControl(int32 CameraIndex, const FVector& MoveInput, const FRotator& RotationInput, bool bFastMove, float DeltaSeconds);
 	void AimCameraAtFocusPoint(int32 CameraIndex);
 	void ApplyDeckLinkInputPlateControl(const FVector& MoveInput, const FRotator& RotationInput, float ScaleDirection, bool bFastMove, float DeltaSeconds);
+	void ApplyChromaKeyPlateControl(const FVector& MoveInput, const FRotator& RotationInput, float ScaleDirection, bool bFastMove, float DeltaSeconds);
 	void ApplyExpressLoopMediaPlateControl(const FVector& MoveInput, const FRotator& RotationInput, float ScaleDirection, bool bFastMove, float DeltaSeconds);
 	void ResetDeckLinkInputPlate();
+	void ResetChromaKeyPlate();
 	void ResetExpressLoopMediaPlate();
 	FString ResolveExpressLoopMediaFilePath(const FString& FilePath) const;
 	bool OpenExpressLoopMediaFile(const FString& FilePath, bool bShowStatus);
+	bool LoadChromaKeySourceImage(const FString& ImagePath);
+	void RebuildChromaKeyTexture();
+	void ApplyChromaKeySettings(const FGGGWebControlCommand& Command, bool bShowStatus);
 	void ConfigureExpressLoopMediaPlayer(UMediaPlayer* MediaPlayer, bool bPlayOnOpen) const;
 	void ConfigureExpressLoopMediaSource(UFileMediaSource* MediaSource, const FString& FilePath) const;
 	void RefreshExpressLoopMediaPlayerDelegates();
@@ -138,6 +154,7 @@ private:
 	void LogDeckLinkOutputConfigurations() const;
 	void ShowCameraControlStatus() const;
 	void ShowDeckLinkInputPlateControlStatus() const;
+	void ShowChromaKeyPlateControlStatus() const;
 	void ShowExpressLoopMediaPlateControlStatus() const;
 	bool FindDeckLinkInputConfiguration(int32 DeviceIdentifier, FMediaIOConfiguration& OutConfiguration) const;
 	bool FindDeckLinkOutputConfiguration(int32 DeviceIdentifier, FMediaIOOutputConfiguration& OutConfiguration) const;
@@ -183,6 +200,26 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UStaticMeshComponent> DeckLinkInputScreenMeshComponent;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTexture2D> ChromaKeyPlateTexture;
+
+	UPROPERTY(Transient)
+	TObjectPtr<AActor> ChromaKeyPlateActor;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> ChromaKeyPlateMeshComponent;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> ChromaKeyPlateMaterial;
+
+	TArray<FColor> ChromaKeySourcePixels;
+	int32 ChromaKeyTextureWidth = 0;
+	int32 ChromaKeyTextureHeight = 0;
+	bool bChromaKeyEnabled = false;
+	float ChromaKeyTolerance = 0.12f;
+	float ChromaKeySoftness = 0.22f;
+	float ChromaKeyDespill = 0.75f;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UFileMediaSource> ExpressLoopMediaSource;
@@ -250,6 +287,9 @@ private:
 	TObjectPtr<UMaterialInterface> DeckLinkInputScreenMaterial;
 
 	UPROPERTY()
+	TObjectPtr<UMaterialInterface> ChromaKeyScreenMaterial;
+
+	UPROPERTY()
 	TObjectPtr<UStaticMesh> StudioRoomMesh;
 
 	UPROPERTY()
@@ -257,8 +297,10 @@ private:
 
 	int32 SelectedCameraIndex = 0;
 	bool bControllingDeckLinkInputPlate = false;
+	bool bControllingChromaKeyPlate = false;
 	bool bControllingExpressLoopMediaPlate = false;
 	bool bExpressLoopMediaRestarting = false;
 	float DeckLinkInputPlateScaleFactor = 1.0f;
+	float ChromaKeyPlateScaleFactor = 1.0f;
 	float ExpressLoopMediaPlateScaleFactor = 1.0f;
 };

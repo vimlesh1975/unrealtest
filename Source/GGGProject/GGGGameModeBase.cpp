@@ -33,6 +33,8 @@
 #include "HttpServerRequest.h"
 #include "HttpServerResponse.h"
 #include "IHttpRouter.h"
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
 #include "ImageUtils.h"
 #include "InputCoreTypes.h"
 #include "Kismet/KismetMathLibrary.h"
@@ -47,6 +49,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
+#include "Modules/ModuleManager.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "TimerManager.h"
@@ -122,14 +125,24 @@ bool IsEquivalentFrameRate(const FFrameRate& FrameRate, int32 Numerator, int32 D
 }
 
 const FVector StudioCameraFocusPoint(0.0f, 610.0f, 250.0f);
-const FVector DeckLinkInputPlateDefaultLocation(-280.0f, 610.0f, 255.0f);
+const FVector DeckLinkInputPlateDefaultLocation(-430.0f, 610.0f, 255.0f);
 const FRotator DeckLinkInputPlateDefaultRotation(0.0f, 0.0f, 90.0f);
 const FVector DeckLinkInputPlateDefaultScale(-4.2f, 2.3625f, 1.0f);
 constexpr float DeckLinkInputPlateMinScale = 0.2f;
 constexpr float DeckLinkInputPlateMaxScale = 5.0f;
+const TCHAR* ChromaKeyPlateRelativePath = TEXT("media/green_screen_studio.jpg");
+const FVector ChromaKeyPlateDefaultLocation(0.0f, 607.0f, 255.0f);
+const FRotator ChromaKeyPlateDefaultRotation(0.0f, 0.0f, 90.0f);
+const FVector ChromaKeyPlateDefaultScale(-4.0f, 2.66f, 1.0f);
+constexpr float ChromaKeyPlateMinScale = 0.2f;
+constexpr float ChromaKeyPlateMaxScale = 5.0f;
+constexpr bool bDefaultChromaKeyEnabled = false;
+constexpr float DefaultChromaKeyTolerance = 0.12f;
+constexpr float DefaultChromaKeySoftness = 0.22f;
+constexpr float DefaultChromaKeyDespill = 0.75f;
 const TCHAR* ExpressLoopMediaRelativePath = TEXT("media/go1080p25.mp4");
 const FName ExpressLoopMediaPlayerName(TEXT("WmfMedia"));
-const FVector ExpressLoopMediaPlateLocation(280.0f, 610.0f, 255.0f);
+const FVector ExpressLoopMediaPlateLocation(430.0f, 610.0f, 255.0f);
 const FRotator ExpressLoopMediaPlateRotation(0.0f, 0.0f, 90.0f);
 const FVector ExpressLoopMediaPlateScale(-4.2f, 2.3625f, 1.0f);
 constexpr float ExpressLoopMediaPlateMinScale = 0.2f;
@@ -152,6 +165,13 @@ bool ShouldPrecacheExpressLoopMediaFile(const FString& FilePath)
 {
 	const int64 FileSize = IFileManager::Get().FileSize(*FilePath);
 	return FileSize >= 0 && FileSize <= ExpressLoopMediaPrecacheMaxBytes;
+}
+
+float SmoothStepClamped(float Edge0, float Edge1, float Value)
+{
+	const float Range = FMath::Max(Edge1 - Edge0, KINDA_SMALL_NUMBER);
+	const float Alpha = FMath::Clamp((Value - Edge0) / Range, 0.0f, 1.0f);
+	return Alpha * Alpha * (3.0f - 2.0f * Alpha);
 }
 
 float ReadJsonNumber(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName, float DefaultValue = 0.0f)
@@ -214,6 +234,20 @@ FString BuildJsonString(const FString& Value)
 	return FString::Printf(TEXT("\"%s\""), *EscapedValue);
 }
 
+void AddSingleHttpHeader(FHttpServerResponse& Response, const TCHAR* Key, const TCHAR* Value)
+{
+	TArray<FString> HeaderValues;
+	HeaderValues.Add(Value);
+	Response.Headers.Add(Key, MoveTemp(HeaderValues));
+}
+
+void AddNoCacheHeaders(FHttpServerResponse& Response)
+{
+	AddSingleHttpHeader(Response, TEXT("Cache-Control"), TEXT("no-store, no-cache, must-revalidate, max-age=0"));
+	AddSingleHttpHeader(Response, TEXT("Pragma"), TEXT("no-cache"));
+	AddSingleHttpHeader(Response, TEXT("Expires"), TEXT("0"));
+}
+
 FString SanitizeUploadedFileName(const FString& UploadedFileName)
 {
 	FString CleanFileName = FPaths::GetCleanFilename(UploadedFileName);
@@ -261,6 +295,18 @@ void ApplyMediaTextureToMaterial(UMaterialInstanceDynamic* DynamicMaterial, UTex
 	DynamicMaterial->SetScalarParameterValue(TEXT("Opacity"), 1.0f);
 	DynamicMaterial->SetScalarParameterValue(TEXT("OpacityFromTexture"), 1.0f);
 }
+
+void ApplyChromaKeyTextureToMaterial(UMaterialInstanceDynamic* DynamicMaterial, UTexture* PlateTexture)
+{
+	if (!DynamicMaterial || !PlateTexture)
+	{
+		return;
+	}
+
+	ApplyMediaTextureToMaterial(DynamicMaterial, PlateTexture);
+	DynamicMaterial->SetTextureParameterValue(TEXT("Texture"), PlateTexture);
+	DynamicMaterial->SetScalarParameterValue(TEXT("Opacity"), 1.0f);
+}
 }
 
 AGGGGameModeBase::AGGGGameModeBase()
@@ -284,6 +330,9 @@ AGGGGameModeBase::AGGGGameModeBase()
 		static ConstructorHelpers::FObjectFinder<UMaterialInterface> ScreenMaterialFinder(TEXT("/Engine/EngineMaterials/Widget3DPassThrough_Opaque.Widget3DPassThrough_Opaque"));
 		DeckLinkInputScreenMaterial = ScreenMaterialFinder.Object;
 	}
+
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> ChromaKeyMaterialFinder(TEXT("/Engine/EngineMaterials/Widget3DPassThrough_Masked.Widget3DPassThrough_Masked"));
+	ChromaKeyScreenMaterial = ChromaKeyMaterialFinder.Object;
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> RoomMeshFinder(TEXT("/Engine/BasicShapes/Cube.Cube"));
 	StudioRoomMesh = RoomMeshFinder.Object;
@@ -611,6 +660,7 @@ void AGGGGameModeBase::SetupSplitScreenCameras()
 	}
 	SelectedCameraIndex = 0;
 	bControllingDeckLinkInputPlate = false;
+	bControllingChromaKeyPlate = false;
 	bControllingExpressLoopMediaPlate = false;
 	ShowCameraControlStatus();
 	UpdateSelectedViewportCamera();
@@ -618,6 +668,7 @@ void AGGGGameModeBase::SetupSplitScreenCameras()
 	UE_LOG(LogTemp, Display, TEXT("Viewport monitor grid is showing cameras 1-4 from the DeckLink render targets."));
 
 	SetupDeckLinkInputScreen();
+	SetupChromaKeyPlate();
 	SetupExpressLoopMediaPlate();
 	SetupDeckLinkOutputs(OrderedCameras);
 }
@@ -664,6 +715,11 @@ void AGGGGameModeBase::HandleCameraControl(float DeltaSeconds)
 		SelectExpressLoopMediaPlateControl(true);
 	}
 
+	if (PlayerController->WasInputKeyJustPressed(EKeys::Seven) && ChromaKeyPlateActor && ChromaKeyPlateMeshComponent)
+	{
+		SelectChromaKeyPlateControl(true);
+	}
+
 	const TPair<FKey, int32> CameraSelectKeys[] = {
 		TPair<FKey, int32>(EKeys::One, 0),
 		TPair<FKey, int32>(EKeys::Two, 1),
@@ -682,6 +738,12 @@ void AGGGGameModeBase::HandleCameraControl(float DeltaSeconds)
 	if (bControllingDeckLinkInputPlate)
 	{
 		HandleDeckLinkInputPlateControl(PlayerController, DeltaSeconds);
+		return;
+	}
+
+	if (bControllingChromaKeyPlate)
+	{
+		HandleChromaKeyPlateControl(PlayerController, DeltaSeconds);
 		return;
 	}
 
@@ -751,6 +813,39 @@ void AGGGGameModeBase::HandleDeckLinkInputPlateControl(APlayerController* Player
 	}
 }
 
+void AGGGGameModeBase::HandleChromaKeyPlateControl(APlayerController* PlayerController, float DeltaSeconds)
+{
+	if (!PlayerController || !ChromaKeyPlateActor || !ChromaKeyPlateMeshComponent)
+	{
+		return;
+	}
+
+	const bool bFastMove = PlayerController->IsInputKeyDown(EKeys::LeftShift) || PlayerController->IsInputKeyDown(EKeys::RightShift);
+	const FVector MoveInput(
+		(PlayerController->IsInputKeyDown(EKeys::W) ? 1.0f : 0.0f) - (PlayerController->IsInputKeyDown(EKeys::S) ? 1.0f : 0.0f),
+		(PlayerController->IsInputKeyDown(EKeys::D) ? 1.0f : 0.0f) - (PlayerController->IsInputKeyDown(EKeys::A) ? 1.0f : 0.0f),
+		(PlayerController->IsInputKeyDown(EKeys::E) ? 1.0f : 0.0f) - (PlayerController->IsInputKeyDown(EKeys::Q) ? 1.0f : 0.0f));
+
+	FRotator RotationDelta = FRotator::ZeroRotator;
+	RotationDelta.Pitch += PlayerController->IsInputKeyDown(EKeys::Up) ? -1.0f : 0.0f;
+	RotationDelta.Pitch += PlayerController->IsInputKeyDown(EKeys::Down) ? 1.0f : 0.0f;
+	RotationDelta.Yaw += PlayerController->IsInputKeyDown(EKeys::Right) ? 1.0f : 0.0f;
+	RotationDelta.Yaw += PlayerController->IsInputKeyDown(EKeys::Left) ? -1.0f : 0.0f;
+	RotationDelta.Roll += PlayerController->IsInputKeyDown(EKeys::C) ? 1.0f : 0.0f;
+	RotationDelta.Roll += PlayerController->IsInputKeyDown(EKeys::Z) ? -1.0f : 0.0f;
+
+	float ScaleDirection = 0.0f;
+	ScaleDirection += (PlayerController->IsInputKeyDown(EKeys::Equals) || PlayerController->IsInputKeyDown(EKeys::Add)) ? 1.0f : 0.0f;
+	ScaleDirection -= (PlayerController->IsInputKeyDown(EKeys::Hyphen) || PlayerController->IsInputKeyDown(EKeys::Subtract)) ? 1.0f : 0.0f;
+	ApplyChromaKeyPlateControl(MoveInput, RotationDelta, ScaleDirection, bFastMove, DeltaSeconds);
+
+	if (PlayerController->WasInputKeyJustPressed(EKeys::R))
+	{
+		ResetChromaKeyPlate();
+		ShowChromaKeyPlateControlStatus();
+	}
+}
+
 void AGGGGameModeBase::HandleExpressLoopMediaPlateControl(APlayerController* PlayerController, float DeltaSeconds)
 {
 	if (!PlayerController || !ExpressLoopMediaPlateActor || !ExpressLoopMediaPlateMeshComponent)
@@ -792,6 +887,7 @@ void AGGGGameModeBase::SelectCameraControl(int32 CameraIndex, bool bShowStatus)
 	}
 
 	bControllingDeckLinkInputPlate = false;
+	bControllingChromaKeyPlate = false;
 	bControllingExpressLoopMediaPlate = false;
 	SelectedCameraIndex = CameraIndex;
 	UpdateSelectedViewportCamera();
@@ -810,11 +906,29 @@ void AGGGGameModeBase::SelectDeckLinkInputPlateControl(bool bShowStatus)
 	}
 
 	bControllingDeckLinkInputPlate = true;
+	bControllingChromaKeyPlate = false;
 	bControllingExpressLoopMediaPlate = false;
 
 	if (bShowStatus)
 	{
 		ShowDeckLinkInputPlateControlStatus();
+	}
+}
+
+void AGGGGameModeBase::SelectChromaKeyPlateControl(bool bShowStatus)
+{
+	if (!ChromaKeyPlateActor || !ChromaKeyPlateMeshComponent)
+	{
+		return;
+	}
+
+	bControllingDeckLinkInputPlate = false;
+	bControllingChromaKeyPlate = true;
+	bControllingExpressLoopMediaPlate = false;
+
+	if (bShowStatus)
+	{
+		ShowChromaKeyPlateControlStatus();
 	}
 }
 
@@ -826,6 +940,7 @@ void AGGGGameModeBase::SelectExpressLoopMediaPlateControl(bool bShowStatus)
 	}
 
 	bControllingDeckLinkInputPlate = false;
+	bControllingChromaKeyPlate = false;
 	bControllingExpressLoopMediaPlate = true;
 
 	if (bShowStatus)
@@ -914,6 +1029,47 @@ void AGGGGameModeBase::ApplyDeckLinkInputPlateControl(const FVector& MoveInput, 
 	}
 }
 
+void AGGGGameModeBase::ApplyChromaKeyPlateControl(const FVector& MoveInput, const FRotator& RotationInput, float ScaleDirection, bool bFastMove, float DeltaSeconds)
+{
+	if (!ChromaKeyPlateActor || !ChromaKeyPlateMeshComponent)
+	{
+		return;
+	}
+
+	const float ClampedDeltaSeconds = ClampControlDeltaSeconds(DeltaSeconds);
+	const float MoveSpeed = bFastMove ? 900.0f : 250.0f;
+	const float RotateSpeed = bFastMove ? 120.0f : 40.0f;
+	const float ScaleSpeed = bFastMove ? 1.5f : 0.5f;
+
+	const FRotator PlateYaw(0.0f, ChromaKeyPlateMeshComponent->GetComponentRotation().Yaw, 0.0f);
+	const FVector PlateForward = FRotationMatrix(PlateYaw).GetUnitAxis(EAxis::X);
+	const FVector PlateRight = FRotationMatrix(PlateYaw).GetUnitAxis(EAxis::Y);
+
+	FVector MoveDirection = FVector::ZeroVector;
+	MoveDirection += PlateForward * MoveInput.X;
+	MoveDirection += PlateRight * MoveInput.Y;
+	MoveDirection += FVector::UpVector * MoveInput.Z;
+
+	if (!MoveDirection.IsNearlyZero())
+	{
+		ChromaKeyPlateActor->AddActorWorldOffset(MoveDirection.GetSafeNormal() * MoveSpeed * ClampedDeltaSeconds, false);
+	}
+
+	if (!RotationInput.IsNearlyZero())
+	{
+		ChromaKeyPlateMeshComponent->AddRelativeRotation(RotationInput * RotateSpeed * ClampedDeltaSeconds);
+	}
+
+	if (!FMath::IsNearlyZero(ScaleDirection))
+	{
+		ChromaKeyPlateScaleFactor = FMath::Clamp(
+			ChromaKeyPlateScaleFactor + ScaleDirection * ScaleSpeed * ClampedDeltaSeconds,
+			ChromaKeyPlateMinScale,
+			ChromaKeyPlateMaxScale);
+		ChromaKeyPlateMeshComponent->SetRelativeScale3D(ChromaKeyPlateDefaultScale * ChromaKeyPlateScaleFactor);
+	}
+}
+
 void AGGGGameModeBase::ApplyExpressLoopMediaPlateControl(const FVector& MoveInput, const FRotator& RotationInput, float ScaleDirection, bool bFastMove, float DeltaSeconds)
 {
 	if (!ExpressLoopMediaPlateActor || !ExpressLoopMediaPlateMeshComponent)
@@ -972,6 +1128,23 @@ void AGGGGameModeBase::ResetDeckLinkInputPlate()
 	DeckLinkInputPlateScaleFactor = 1.0f;
 }
 
+void AGGGGameModeBase::ResetChromaKeyPlate()
+{
+	if (ChromaKeyPlateActor)
+	{
+		ChromaKeyPlateActor->SetActorLocation(ChromaKeyPlateDefaultLocation);
+		ChromaKeyPlateActor->SetActorRotation(FRotator::ZeroRotator);
+	}
+
+	if (ChromaKeyPlateMeshComponent)
+	{
+		ChromaKeyPlateMeshComponent->SetRelativeRotation(ChromaKeyPlateDefaultRotation);
+		ChromaKeyPlateMeshComponent->SetRelativeScale3D(ChromaKeyPlateDefaultScale);
+	}
+
+	ChromaKeyPlateScaleFactor = 1.0f;
+}
+
 void AGGGGameModeBase::ResetExpressLoopMediaPlate()
 {
 	if (ExpressLoopMediaPlateActor)
@@ -1011,6 +1184,159 @@ FString AGGGGameModeBase::ResolveExpressLoopMediaFilePath(const FString& FilePat
 	ResolvedPath = FPaths::ConvertRelativePathToFull(ResolvedPath);
 	FPaths::NormalizeFilename(ResolvedPath);
 	return ResolvedPath;
+}
+
+bool AGGGGameModeBase::LoadChromaKeySourceImage(const FString& ImagePath)
+{
+	TArray<uint8> CompressedBytes;
+	if (!FFileHelper::LoadFileToArray(CompressedBytes, *ImagePath) || CompressedBytes.Num() == 0)
+	{
+		return false;
+	}
+
+	IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+	const EImageFormat ImageFormat = ImageWrapperModule.DetectImageFormat(CompressedBytes.GetData(), CompressedBytes.Num());
+	if (ImageFormat == EImageFormat::Invalid)
+	{
+		return false;
+	}
+
+	TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(ImageFormat);
+	if (!ImageWrapper.IsValid() || !ImageWrapper->SetCompressed(CompressedBytes.GetData(), CompressedBytes.Num()))
+	{
+		return false;
+	}
+
+	TArray64<uint8> RawPixels;
+	if (!ImageWrapper->GetRaw(ERGBFormat::BGRA, 8, RawPixels))
+	{
+		return false;
+	}
+
+	ChromaKeyTextureWidth = ImageWrapper->GetWidth();
+	ChromaKeyTextureHeight = ImageWrapper->GetHeight();
+	const int32 PixelCount = ChromaKeyTextureWidth * ChromaKeyTextureHeight;
+	if (PixelCount <= 0 || RawPixels.Num() != PixelCount * static_cast<int64>(sizeof(FColor)))
+	{
+		ChromaKeyTextureWidth = 0;
+		ChromaKeyTextureHeight = 0;
+		return false;
+	}
+
+	ChromaKeySourcePixels.SetNumUninitialized(PixelCount);
+	FMemory::Memcpy(ChromaKeySourcePixels.GetData(), RawPixels.GetData(), RawPixels.Num());
+
+	ChromaKeyPlateTexture = UTexture2D::CreateTransient(ChromaKeyTextureWidth, ChromaKeyTextureHeight, PF_B8G8R8A8, TEXT("ChromaKeyPlateTexture"));
+	if (!ChromaKeyPlateTexture)
+	{
+		ChromaKeySourcePixels.Reset();
+		ChromaKeyTextureWidth = 0;
+		ChromaKeyTextureHeight = 0;
+		return false;
+	}
+
+	ChromaKeyPlateTexture->SRGB = true;
+	ChromaKeyPlateTexture->NeverStream = true;
+	RebuildChromaKeyTexture();
+	return true;
+}
+
+void AGGGGameModeBase::RebuildChromaKeyTexture()
+{
+	if (!ChromaKeyPlateTexture || ChromaKeySourcePixels.Num() == 0 || ChromaKeyTextureWidth <= 0 || ChromaKeyTextureHeight <= 0)
+	{
+		return;
+	}
+
+	const int32 PixelCount = ChromaKeyTextureWidth * ChromaKeyTextureHeight;
+	if (ChromaKeySourcePixels.Num() != PixelCount)
+	{
+		return;
+	}
+
+	TArray<FColor> KeyedPixels;
+	KeyedPixels.SetNumUninitialized(PixelCount);
+	const float Tolerance = FMath::Clamp(ChromaKeyTolerance, 0.0f, 1.0f);
+	const float Softness = FMath::Clamp(ChromaKeySoftness, 0.001f, 1.0f);
+	const float Despill = FMath::Clamp(ChromaKeyDespill, 0.0f, 1.0f);
+
+	for (int32 PixelIndex = 0; PixelIndex < PixelCount; ++PixelIndex)
+	{
+		const FColor SourcePixel = ChromaKeySourcePixels[PixelIndex];
+		float Red = SourcePixel.R / 255.0f;
+		float Green = SourcePixel.G / 255.0f;
+		float Blue = SourcePixel.B / 255.0f;
+		float Alpha = SourcePixel.A / 255.0f;
+
+		if (bChromaKeyEnabled)
+		{
+			const float GreenDominance = Green - FMath::Max(Red, Blue);
+			const float KeyAmount = SmoothStepClamped(Tolerance, Tolerance + Softness, GreenDominance);
+			const float SpillAmount = FMath::Clamp(GreenDominance * 3.0f, 0.0f, 1.0f) * Despill * (1.0f - KeyAmount * 0.65f);
+			Green = FMath::Lerp(Green, FMath::Max(Red, Blue), SpillAmount);
+			Alpha *= 1.0f - KeyAmount;
+		}
+
+		KeyedPixels[PixelIndex] = FColor(
+			static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Red * 255.0f), 0, 255)),
+			static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Green * 255.0f), 0, 255)),
+			static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Blue * 255.0f), 0, 255)),
+			static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Alpha * 255.0f), 0, 255)));
+	}
+
+	FTexturePlatformData* PlatformData = ChromaKeyPlateTexture->GetPlatformData();
+	if (!PlatformData || PlatformData->Mips.Num() == 0)
+	{
+		return;
+	}
+
+	FTexture2DMipMap& Mip = PlatformData->Mips[0];
+	void* TextureData = Mip.BulkData.Lock(LOCK_READ_WRITE);
+	if (TextureData)
+	{
+		FMemory::Memcpy(TextureData, KeyedPixels.GetData(), KeyedPixels.Num() * sizeof(FColor));
+	}
+	Mip.BulkData.Unlock();
+	ChromaKeyPlateTexture->UpdateResource();
+
+	if (ChromaKeyPlateMaterial)
+	{
+		ApplyChromaKeyTextureToMaterial(ChromaKeyPlateMaterial, ChromaKeyPlateTexture);
+	}
+}
+
+void AGGGGameModeBase::ApplyChromaKeySettings(const FGGGWebControlCommand& Command, bool bShowStatus)
+{
+	if (Command.bHasChromaKeyEnabled)
+	{
+		bChromaKeyEnabled = Command.bChromaKeyEnabled;
+	}
+	if (Command.ChromaKeyTolerance >= 0.0f)
+	{
+		ChromaKeyTolerance = FMath::Clamp(Command.ChromaKeyTolerance, 0.0f, 1.0f);
+	}
+	if (Command.ChromaKeySoftness >= 0.0f)
+	{
+		ChromaKeySoftness = FMath::Clamp(Command.ChromaKeySoftness, 0.001f, 1.0f);
+	}
+	if (Command.ChromaKeyDespill >= 0.0f)
+	{
+		ChromaKeyDespill = FMath::Clamp(Command.ChromaKeyDespill, 0.0f, 1.0f);
+	}
+
+	RebuildChromaKeyTexture();
+	if (GEngine && bShowStatus)
+	{
+		GEngine->AddOnScreenDebugMessage(
+			1003,
+			2.0f,
+			FColor::Green,
+			FString::Printf(TEXT("Chroma key: %s tol %.2f soft %.2f despill %.2f"),
+				bChromaKeyEnabled ? TEXT("on") : TEXT("off"),
+				ChromaKeyTolerance,
+				ChromaKeySoftness,
+				ChromaKeyDespill));
+	}
 }
 
 bool AGGGGameModeBase::OpenExpressLoopMediaFile(const FString& FilePath, bool bShowStatus)
@@ -1629,6 +1955,14 @@ void AGGGGameModeBase::ShowDeckLinkInputPlateControlStatus() const
 	}
 }
 
+void AGGGGameModeBase::ShowChromaKeyPlateControlStatus() const
+{
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(1001, 2.0f, FColor::Green, TEXT("Controlling chroma key plate"));
+	}
+}
+
 void AGGGGameModeBase::ShowExpressLoopMediaPlateControlStatus() const
 {
 	if (GEngine)
@@ -1691,7 +2025,9 @@ void AGGGGameModeBase::StartWebControlServer()
 			return false;
 		}
 
-		OnComplete(FHttpServerResponse::Create(GameMode->BuildWebControlPage(), TEXT("text/html; charset=utf-8")));
+		TUniquePtr<FHttpServerResponse> Response = FHttpServerResponse::Create(GameMode->BuildWebControlPage(), TEXT("text/html"));
+		AddNoCacheHeaders(*Response);
+		OnComplete(MoveTemp(Response));
 		return true;
 	});
 
@@ -1712,10 +2048,12 @@ void AGGGGameModeBase::StartWebControlServer()
 
 		if (StateJson.IsEmpty())
 		{
-			StateJson = TEXT("{\"selected\":{\"target\":\"camera\",\"cameraIndex\":0,\"cameraNumber\":1},\"cameras\":[],\"plate\":{\"available\":false},\"mp4\":{\"available\":false}}");
+			StateJson = TEXT("{\"selected\":{\"target\":\"camera\",\"cameraIndex\":0,\"cameraNumber\":1},\"cameras\":[],\"plate\":{\"available\":false},\"key\":{\"available\":false},\"mp4\":{\"available\":false}}");
 		}
 
-		OnComplete(FHttpServerResponse::Create(StateJson, TEXT("application/json; charset=utf-8")));
+		TUniquePtr<FHttpServerResponse> Response = FHttpServerResponse::Create(StateJson, TEXT("application/json"));
+		AddNoCacheHeaders(*Response);
+		OnComplete(MoveTemp(Response));
 		return true;
 	});
 
@@ -1742,7 +2080,9 @@ void AGGGGameModeBase::StartWebControlServer()
 			return true;
 		}
 
-		OnComplete(FHttpServerResponse::Create(TEXT("{\"ok\":true}"), TEXT("application/json; charset=utf-8")));
+		TUniquePtr<FHttpServerResponse> Response = FHttpServerResponse::Create(TEXT("{\"ok\":true}"), TEXT("application/json"));
+		AddNoCacheHeaders(*Response);
+		OnComplete(MoveTemp(Response));
 		return true;
 	});
 
@@ -1776,7 +2116,9 @@ void AGGGGameModeBase::StartWebControlServer()
 			TEXT("{\"ok\":true,\"filePath\":%s,\"fileName\":%s}"),
 			*BuildJsonString(SavedFilePath),
 			*BuildJsonString(FPaths::GetCleanFilename(SavedFilePath)));
-		OnComplete(FHttpServerResponse::Create(ResponseJson, TEXT("application/json; charset=utf-8")));
+		TUniquePtr<FHttpServerResponse> Response = FHttpServerResponse::Create(ResponseJson, TEXT("application/json"));
+		AddNoCacheHeaders(*Response);
+		OnComplete(MoveTemp(Response));
 		return true;
 	});
 
@@ -1875,6 +2217,31 @@ void AGGGGameModeBase::ProcessWebControlCommands()
 					ApplyDeckLinkInputPlateControl(Command.Move, Command.Rotation, Command.Scale, Command.bFast, Command.DeltaSeconds);
 				}
 			}
+			else if (Command.Target == EGGGWebControlTarget::ChromaKeyPlate)
+			{
+				if (!ChromaKeyPlateActor || !ChromaKeyPlateMeshComponent)
+				{
+					continue;
+				}
+
+				SelectChromaKeyPlateControl(Command.bSelectOnly || Command.bSetChromaKeySettings);
+				if (Command.bSetChromaKeySettings)
+				{
+					ApplyChromaKeySettings(Command, true);
+				}
+
+				if (Command.bReset)
+				{
+					ResetChromaKeyPlate();
+					ShowChromaKeyPlateControlStatus();
+					continue;
+				}
+
+				if (!Command.bSelectOnly)
+				{
+					ApplyChromaKeyPlateControl(Command.Move, Command.Rotation, Command.Scale, Command.bFast, Command.DeltaSeconds);
+				}
+			}
 			else
 			{
 				if (!ExpressLoopMediaPlateActor || !ExpressLoopMediaPlateMeshComponent)
@@ -1931,6 +2298,10 @@ bool AGGGGameModeBase::EnqueueWebControlCommandFromJson(const FString& RequestBo
 		{
 			Command.Target = EGGGWebControlTarget::DeckLinkInputPlate;
 		}
+		else if (NormalizedTarget == TEXT("key") || NormalizedTarget == TEXT("chroma") || NormalizedTarget == TEXT("chromakey") || NormalizedTarget == TEXT("green") || NormalizedTarget == TEXT("chromakeyplate"))
+		{
+			Command.Target = EGGGWebControlTarget::ChromaKeyPlate;
+		}
 		else if (NormalizedTarget == TEXT("mp4") || NormalizedTarget == TEXT("media") || NormalizedTarget == TEXT("file") || NormalizedTarget == TEXT("express") || NormalizedTarget == TEXT("expressloopmediaplate"))
 		{
 			Command.Target = EGGGWebControlTarget::ExpressLoopMediaPlate;
@@ -1944,7 +2315,7 @@ bool AGGGGameModeBase::EnqueueWebControlCommandFromJson(const FString& RequestBo
 	{
 		Command.Target = bControllingDeckLinkInputPlate
 			? EGGGWebControlTarget::DeckLinkInputPlate
-			: (bControllingExpressLoopMediaPlate ? EGGGWebControlTarget::ExpressLoopMediaPlate : EGGGWebControlTarget::Camera);
+			: (bControllingChromaKeyPlate ? EGGGWebControlTarget::ChromaKeyPlate : (bControllingExpressLoopMediaPlate ? EGGGWebControlTarget::ExpressLoopMediaPlate : EGGGWebControlTarget::Camera));
 	}
 
 	Command.CameraIndex = SelectedCameraIndex;
@@ -1984,9 +2355,24 @@ bool AGGGGameModeBase::EnqueueWebControlCommandFromJson(const FString& RequestBo
 		Command.bLookAt = NormalizedAction == TEXT("lookat") || NormalizedAction == TEXT("aim") || NormalizedAction == TEXT("aimcenter");
 		Command.bReset = NormalizedAction == TEXT("reset");
 		Command.bSetFile = NormalizedAction == TEXT("setfile") || NormalizedAction == TEXT("loadfile") || NormalizedAction == TEXT("setmp4") || NormalizedAction == TEXT("loadmp4");
+		Command.bSetChromaKeySettings = NormalizedAction == TEXT("setchromakey") || NormalizedAction == TEXT("setkey") || NormalizedAction == TEXT("keysettings") || NormalizedAction == TEXT("chromakeysettings");
 		if (Command.bSetFile)
 		{
 			Command.Target = EGGGWebControlTarget::ExpressLoopMediaPlate;
+		}
+		if (Command.bSetChromaKeySettings)
+		{
+			Command.Target = EGGGWebControlTarget::ChromaKeyPlate;
+		}
+		if (NormalizedAction == TEXT("resetchromakey") || NormalizedAction == TEXT("resetkeysettings") || NormalizedAction == TEXT("resetchromakeysettings"))
+		{
+			Command.Target = EGGGWebControlTarget::ChromaKeyPlate;
+			Command.bSetChromaKeySettings = true;
+			Command.bHasChromaKeyEnabled = true;
+			Command.bChromaKeyEnabled = bDefaultChromaKeyEnabled;
+			Command.ChromaKeyTolerance = DefaultChromaKeyTolerance;
+			Command.ChromaKeySoftness = DefaultChromaKeySoftness;
+			Command.ChromaKeyDespill = DefaultChromaKeyDespill;
 		}
 	}
 
@@ -2026,6 +2412,49 @@ bool AGGGGameModeBase::EnqueueWebControlCommandFromJson(const FString& RequestBo
 		{
 			OutError = TEXT("MP4 filePath is empty.");
 			return false;
+		}
+	}
+
+	const TSharedPtr<FJsonObject>* ChromaObject = nullptr;
+	TSharedPtr<FJsonObject> ChromaSettingsObject = JsonObject;
+	if (JsonObject->TryGetObjectField(TEXT("chroma"), ChromaObject) && ChromaObject && ChromaObject->IsValid())
+	{
+		ChromaSettingsObject = *ChromaObject;
+		Command.Target = EGGGWebControlTarget::ChromaKeyPlate;
+		Command.bSetChromaKeySettings = true;
+	}
+
+	if (ChromaSettingsObject.IsValid())
+	{
+		bool bChromaEnabled = false;
+		if (ChromaSettingsObject->TryGetBoolField(TEXT("enabled"), bChromaEnabled)
+			|| ChromaSettingsObject->TryGetBoolField(TEXT("keyEnabled"), bChromaEnabled)
+			|| ChromaSettingsObject->TryGetBoolField(TEXT("chromaKeyEnabled"), bChromaEnabled))
+		{
+			Command.bHasChromaKeyEnabled = true;
+			Command.bChromaKeyEnabled = bChromaEnabled;
+			Command.Target = EGGGWebControlTarget::ChromaKeyPlate;
+			Command.bSetChromaKeySettings = true;
+		}
+
+		double ChromaNumber = 0.0;
+		if (ChromaSettingsObject->TryGetNumberField(TEXT("tolerance"), ChromaNumber))
+		{
+			Command.ChromaKeyTolerance = static_cast<float>(ChromaNumber);
+			Command.Target = EGGGWebControlTarget::ChromaKeyPlate;
+			Command.bSetChromaKeySettings = true;
+		}
+		if (ChromaSettingsObject->TryGetNumberField(TEXT("softness"), ChromaNumber))
+		{
+			Command.ChromaKeySoftness = static_cast<float>(ChromaNumber);
+			Command.Target = EGGGWebControlTarget::ChromaKeyPlate;
+			Command.bSetChromaKeySettings = true;
+		}
+		if (ChromaSettingsObject->TryGetNumberField(TEXT("despill"), ChromaNumber))
+		{
+			Command.ChromaKeyDespill = static_cast<float>(ChromaNumber);
+			Command.Target = EGGGWebControlTarget::ChromaKeyPlate;
+			Command.bSetChromaKeySettings = true;
 		}
 	}
 
@@ -2158,6 +2587,14 @@ h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; }
 .file-row { display: grid; grid-template-columns: minmax(0, 1fr) 84px; gap: 8px; }
 .hidden-file { display: none; }
 .spacer { visibility: hidden; }
+.slider-row {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr) 48px;
+  gap: 8px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 13px;
+}
 button, .toggle, input[type="text"] {
   min-height: 42px;
   border: 1px solid var(--line);
@@ -2176,6 +2613,11 @@ input[type="text"] {
   cursor: text;
   user-select: text;
   padding: 0 10px;
+}
+input[type="range"] {
+  width: 100%;
+  min-width: 0;
+  accent-color: var(--accent-2);
 }
 button:hover, .toggle:hover { border-color: #617283; }
 input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -2237,6 +2679,7 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
         <button data-target="camera" data-index="2">Cam 3</button>
         <button data-target="camera" data-index="3">Cam 4</button>
         <button data-target="plate">Input</button>
+        <button data-target="key">Key</button>
         <button data-target="mp4">MP4</button>
       </div>
       <label class="toggle"><input id="fast" type="checkbox"> Fast</label>
@@ -2255,6 +2698,26 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
       <input id="mp4FileInput" class="hidden-file" type="file" accept=".mp4,video/mp4">
       <button id="chooseMp4File">Choose File</button>
       <div class="value" id="mp4FileText">Waiting for MP4 state</div>
+    </div>
+    <div class="stack">
+      <h2>Chroma Key</h2>
+      <label class="toggle"><input id="keyEnabled" type="checkbox"> Enable</label>
+      <div class="slider-row">
+        <span>Tolerance</span>
+        <input id="keyTolerance" type="range" min="0" max="1" step="0.01">
+        <span id="keyToleranceValue">0.12</span>
+      </div>
+      <div class="slider-row">
+        <span>Softness</span>
+        <input id="keySoftness" type="range" min="0.01" max="1" step="0.01">
+        <span id="keySoftnessValue">0.22</span>
+      </div>
+      <div class="slider-row">
+        <span>Despill</span>
+        <input id="keyDespill" type="range" min="0" max="1" step="0.01">
+        <span id="keyDespillValue">0.75</span>
+      </div>
+      <button id="resetKeySettings">Reset Key Settings</button>
     </div>
   </section>
   <section class="stack">
@@ -2294,6 +2757,9 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 const pulseMs = 80;
 let selected = { target: "camera", cameraIndex: 0 };
 let lastState = null;
+let keySettingsSyncing = false;
+let keySettingsTimer = null;
+const defaultKeySettings = { enabled: false, tolerance: 0.12, softness: 0.22, despill: 0.75 };
 
 function basePayload() {
   return {
@@ -2305,7 +2771,7 @@ function basePayload() {
 }
 
 function isPlateLikeTarget() {
-  return selected.target === "plate" || selected.target === "mp4";
+  return selected.target === "plate" || selected.target === "key" || selected.target === "mp4";
 }
 
 async function postControl(command) {
@@ -2319,6 +2785,52 @@ async function postControl(command) {
   } catch (error) {
     document.getElementById("selectedText").textContent = "Control connection lost";
   }
+}
+
+function formatKeyValue(value) {
+  return Number(value || 0).toFixed(2);
+}
+
+function collectKeySettings() {
+  return {
+    enabled: document.getElementById("keyEnabled").checked,
+    tolerance: Number(document.getElementById("keyTolerance").value),
+    softness: Number(document.getElementById("keySoftness").value),
+    despill: Number(document.getElementById("keyDespill").value)
+  };
+}
+
+function renderKeySettings(key) {
+  const activeId = document.activeElement && document.activeElement.id;
+  if (keySettingsTimer || activeId === "keyTolerance" || activeId === "keySoftness" || activeId === "keyDespill") {
+    return;
+  }
+
+  const settings = (key && key.chroma) || defaultKeySettings;
+  keySettingsSyncing = true;
+  document.getElementById("keyEnabled").checked = settings.enabled !== false;
+  document.getElementById("keyTolerance").value = settings.tolerance ?? defaultKeySettings.tolerance;
+  document.getElementById("keySoftness").value = settings.softness ?? defaultKeySettings.softness;
+  document.getElementById("keyDespill").value = settings.despill ?? defaultKeySettings.despill;
+  document.getElementById("keyToleranceValue").textContent = formatKeyValue(document.getElementById("keyTolerance").value);
+  document.getElementById("keySoftnessValue").textContent = formatKeyValue(document.getElementById("keySoftness").value);
+  document.getElementById("keyDespillValue").textContent = formatKeyValue(document.getElementById("keyDespill").value);
+  keySettingsSyncing = false;
+}
+
+function sendKeySettings(delay = 160) {
+  if (keySettingsSyncing) return;
+  const settings = collectKeySettings();
+  document.getElementById("keyToleranceValue").textContent = formatKeyValue(settings.tolerance);
+  document.getElementById("keySoftnessValue").textContent = formatKeyValue(settings.softness);
+  document.getElementById("keyDespillValue").textContent = formatKeyValue(settings.despill);
+  selected = { target: "key", cameraIndex: selected.cameraIndex || 0 };
+  updateTargetButtons();
+  clearTimeout(keySettingsTimer);
+  keySettingsTimer = setTimeout(() => {
+    keySettingsTimer = null;
+    postControl({ action: "setChromaKey", target: "key", chroma: settings });
+  }, delay);
 }
 
 function selectTarget(target, index) {
@@ -2340,7 +2852,7 @@ function updateTargetButtons() {
   const plateLike = isPlateLikeTarget();
   document.querySelectorAll("[data-plate-only]").forEach(button => button.disabled = !plateLike);
   document.getElementById("aimReset").textContent =
-    selected.target === "camera" ? "Aim Center" : (selected.target === "mp4" ? "Reset MP4" : "Reset Input");
+    selected.target === "camera" ? "Aim Center" : (selected.target === "mp4" ? "Reset MP4" : (selected.target === "key" ? "Reset Key" : "Reset Input"));
 }
 
 function setupHold(button, command) {
@@ -2431,6 +2943,7 @@ async function uploadMp4File(file) {
 function renderState(state) {
   lastState = state;
   renderMp4File(state.mp4);
+  renderKeySettings(state.key);
 
   if (state.selected) {
     selected.target = state.selected.target;
@@ -2443,6 +2956,9 @@ function renderState(state) {
   if (selected.target === "plate") {
     source = state.plate;
     label = "DeckLink input plate";
+  } else if (selected.target === "key") {
+    source = state.key;
+    label = "Chroma key plate";
   } else if (selected.target === "mp4") {
     source = state.mp4;
     label = "MP4 media plate";
@@ -2498,6 +3014,20 @@ document.getElementById("chooseMp4File").addEventListener("click", () => {
 document.getElementById("mp4FileInput").addEventListener("change", event => {
   uploadMp4File(event.target.files && event.target.files[0]);
 });
+document.getElementById("keyEnabled").addEventListener("change", () => sendKeySettings(0));
+["keyTolerance", "keySoftness", "keyDespill"].forEach(id => {
+  document.getElementById(id).addEventListener("input", () => sendKeySettings());
+  document.getElementById(id).addEventListener("change", () => sendKeySettings(0));
+});
+document.getElementById("resetKeySettings").addEventListener("click", () => {
+  keySettingsSyncing = true;
+  document.getElementById("keyEnabled").checked = defaultKeySettings.enabled;
+  document.getElementById("keyTolerance").value = defaultKeySettings.tolerance;
+  document.getElementById("keySoftness").value = defaultKeySettings.softness;
+  document.getElementById("keyDespill").value = defaultKeySettings.despill;
+  keySettingsSyncing = false;
+  sendKeySettings(0);
+});
 document.getElementById("serverText").textContent = `${window.location.protocol}//${window.location.host}/c`;
 
 updateTargetButtons();
@@ -2544,6 +3074,20 @@ FString AGGGGameModeBase::BuildWebControlStateJson() const
 			DeckLinkInputPlateScaleFactor);
 	}
 
+	FString KeyJson = TEXT("\"available\":false");
+	if (ChromaKeyPlateActor && ChromaKeyPlateMeshComponent)
+	{
+		KeyJson = FString::Printf(
+			TEXT("\"available\":true,\"location\":%s,\"rotation\":%s,\"scale\":%.3f,\"chroma\":{\"enabled\":%s,\"tolerance\":%.3f,\"softness\":%.3f,\"despill\":%.3f}"),
+			*BuildVectorJson(ChromaKeyPlateActor->GetActorLocation()),
+			*BuildRotatorJson(ChromaKeyPlateMeshComponent->GetComponentRotation()),
+			ChromaKeyPlateScaleFactor,
+			bChromaKeyEnabled ? TEXT("true") : TEXT("false"),
+			ChromaKeyTolerance,
+			ChromaKeySoftness,
+			ChromaKeyDespill);
+	}
+
 	const FString Mp4FilePathJson = BuildJsonString(ExpressLoopMediaFilePath);
 	const FString Mp4FileNameJson = BuildJsonString(FPaths::GetCleanFilename(ExpressLoopMediaFilePath));
 	const FString Mp4StatusJson = BuildJsonString(ExpressLoopMediaStatus);
@@ -2569,19 +3113,24 @@ FString AGGGGameModeBase::BuildWebControlStateJson() const
 	{
 		SelectedTargetString = TEXT("plate");
 	}
+	else if (bControllingChromaKeyPlate)
+	{
+		SelectedTargetString = TEXT("key");
+	}
 	else if (bControllingExpressLoopMediaPlate)
 	{
 		SelectedTargetString = TEXT("mp4");
 	}
 
 	return FString::Printf(
-		TEXT("{\"webPort\":%u,\"selected\":{\"target\":\"%s\",\"cameraIndex\":%d,\"cameraNumber\":%d},\"cameras\":[%s],\"plate\":{%s},\"mp4\":{%s}}"),
+		TEXT("{\"webPort\":%u,\"selected\":{\"target\":\"%s\",\"cameraIndex\":%d,\"cameraNumber\":%d},\"cameras\":[%s],\"plate\":{%s},\"key\":{%s},\"mp4\":{%s}}"),
 		WebControlPort,
 		SelectedTargetString,
 		SelectedCameraIndex,
 		SelectedCameraIndex + 1,
 		*CameraJson,
 		*PlateJson,
+		*KeyJson,
 		*Mp4Json);
 }
 
@@ -2721,6 +3270,59 @@ void AGGGGameModeBase::SetupDeckLinkInputScreen()
 	UE_LOG(LogTemp, Display, TEXT("DeckLink input device %d is placed in the scene as a visible video screen with stereo audio routed into Unreal."), DeckLinkInputDeviceId);
 }
 
+void AGGGGameModeBase::SetupChromaKeyPlate()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	if (!DeckLinkInputDisplayMesh || !DeckLinkInputScreenMaterial)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Chroma key plate skipped: engine display mesh or fallback material is unavailable."));
+		return;
+	}
+
+	const FString ChromaKeyImagePath = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectContentDir(), ChromaKeyPlateRelativePath));
+	if (!FPaths::FileExists(ChromaKeyImagePath))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Chroma key plate skipped: image not found at %s."), *ChromaKeyImagePath);
+		return;
+	}
+
+	if (!LoadChromaKeySourceImage(ChromaKeyImagePath) || !ChromaKeyPlateTexture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Chroma key plate skipped: could not load %s."), *ChromaKeyImagePath);
+		return;
+	}
+
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Name = TEXT("ChromaKeyPlate");
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	ChromaKeyPlateActor = World->SpawnActor<AActor>(AActor::StaticClass(), ChromaKeyPlateDefaultLocation, FRotator::ZeroRotator, SpawnParameters);
+	if (!ChromaKeyPlateActor)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Chroma key plate skipped: could not spawn the plate actor."));
+		return;
+	}
+
+	USceneComponent* PlateRootComponent = NewObject<USceneComponent>(ChromaKeyPlateActor, TEXT("ChromaKeyPlateRoot"));
+	ChromaKeyPlateActor->SetRootComponent(PlateRootComponent);
+	ChromaKeyPlateActor->AddInstanceComponent(PlateRootComponent);
+	PlateRootComponent->SetMobility(EComponentMobility::Movable);
+	PlateRootComponent->RegisterComponent();
+	ChromaKeyPlateActor->SetActorLocation(ChromaKeyPlateDefaultLocation);
+	ChromaKeyPlateActor->SetActorRotation(FRotator::ZeroRotator);
+
+	AddChromaKeyPlateMesh(ChromaKeyPlateActor, ChromaKeyPlateTexture);
+	ResetChromaKeyPlate();
+
+	UE_LOG(LogTemp, Display, TEXT("Chroma key plate loaded %s and placed between the DeckLink input and MP4 plates using %s."),
+		*ChromaKeyImagePath,
+		ChromaKeyScreenMaterial ? TEXT("runtime alpha key material") : TEXT("fallback media material"));
+}
+
 void AGGGGameModeBase::SetupExpressLoopMediaPlate()
 {
 	UWorld* World = GetWorld();
@@ -2846,6 +3448,33 @@ void AGGGGameModeBase::KickDeckLinkInputAudio()
 
 		UE_LOG(LogTemp, Warning, TEXT("DeckLink input audio track was not reported after %d attempts. Output audio may be silent until the source exposes audio."), DeckLinkInputAudioKickAttempts);
 	}
+}
+
+void AGGGGameModeBase::AddChromaKeyPlateMesh(AActor* PlateActor, UTexture2D* PlateTexture)
+{
+	if (!PlateActor || !PlateActor->GetRootComponent() || !PlateTexture || !DeckLinkInputDisplayMesh || !DeckLinkInputScreenMaterial)
+	{
+		return;
+	}
+
+	ChromaKeyPlateMeshComponent = NewObject<UStaticMeshComponent>(PlateActor, TEXT("ChromaKeyPlateMesh"));
+	ChromaKeyPlateMeshComponent->SetupAttachment(PlateActor->GetRootComponent());
+	ChromaKeyPlateMeshComponent->SetStaticMesh(DeckLinkInputDisplayMesh);
+	ChromaKeyPlateMeshComponent->SetRelativeRotation(ChromaKeyPlateDefaultRotation);
+	ChromaKeyPlateMeshComponent->SetRelativeScale3D(ChromaKeyPlateDefaultScale);
+	ChromaKeyPlateMeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	ChromaKeyPlateMeshComponent->SetGenerateOverlapEvents(false);
+	ChromaKeyPlateMeshComponent->SetCastShadow(false);
+	ChromaKeyPlateMeshComponent->bReceivesDecals = false;
+	ChromaKeyPlateMeshComponent->SetAffectDistanceFieldLighting(false);
+	ChromaKeyPlateMeshComponent->SetAffectDynamicIndirectLighting(false);
+
+	PlateActor->AddInstanceComponent(ChromaKeyPlateMeshComponent);
+	ChromaKeyPlateMeshComponent->RegisterComponent();
+
+	UMaterialInterface* MaterialBase = ChromaKeyScreenMaterial ? ChromaKeyScreenMaterial.Get() : DeckLinkInputScreenMaterial.Get();
+	ChromaKeyPlateMaterial = ChromaKeyPlateMeshComponent->CreateAndSetMaterialInstanceDynamicFromMaterial(0, MaterialBase);
+	ApplyChromaKeyTextureToMaterial(ChromaKeyPlateMaterial, PlateTexture);
 }
 
 void AGGGGameModeBase::AddExpressLoopMediaPlateMesh(AActor* PlateActor, UMediaTexture* MediaTexture)
